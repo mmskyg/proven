@@ -51,6 +51,9 @@ CREATE TABLE IF NOT EXISTS ingest_runs (job_id TEXT PRIMARY KEY, base_revision_r
   head_revision_ref TEXT, input_digest TEXT, ts TEXT);
 CREATE TABLE IF NOT EXISTS spec_index (req_id TEXT, file TEXT, section TEXT, heading TEXT,
   body_digest TEXT, tokens TEXT);
+CREATE TABLE IF NOT EXISTS eval_judgments (judgment_id TEXT PRIMARY KEY, kind TEXT, case_id TEXT,
+  verdict TEXT, reason TEXT, judge TEXT, actor_id TEXT, model TEXT, verification_level TEXT, ts TEXT);
+CREATE INDEX IF NOT EXISTS idx_eval_case ON eval_judgments(kind, case_id, judge);
 `;
 
 export function openDb(ws: Workspace): Sqlite.Database {
@@ -183,6 +186,24 @@ export function applyEvent(db: Sqlite.Database, env: EventEnvelope): void {
         `INSERT INTO origin_confirmed(hunk_ref, attribute, confirmed_value, actor_id, ts) VALUES (?,?,?,?,?)
          ON CONFLICT(hunk_ref, attribute) DO UPDATE SET confirmed_value=excluded.confirmed_value, actor_id=excluded.actor_id, ts=excluded.ts`,
       ).run(p.hunk_ref, p.attribute, p.confirmed_value, p.actor_id, env.ts);
+      break;
+    }
+    case "eval_judgment": {
+      const p = env.payload as {
+        judgment_id: string;
+        kind: string;
+        case_id: string;
+        verdict: string;
+        reason: string;
+        judge: string;
+        actor_id: string;
+        model: string | null;
+        verification_level: string;
+      };
+      db.prepare(
+        `INSERT INTO eval_judgments(judgment_id, kind, case_id, verdict, reason, judge, actor_id, model, verification_level, ts)
+         VALUES (?,?,?,?,?,?,?,?,?,?) ON CONFLICT(judgment_id) DO NOTHING`,
+      ).run(p.judgment_id, p.kind, p.case_id, p.verdict, p.reason, p.judge, p.actor_id, p.model, p.verification_level, env.ts);
       break;
     }
     case "analysis_run":

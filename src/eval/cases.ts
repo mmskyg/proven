@@ -1,0 +1,278 @@
+import { ProvenError } from "../shared/errors.js";
+import { SCHEMA_VERSION } from "../shared/types.js";
+import { openDbChecked } from "../store/projections.js";
+import { getObject } from "../store/objects.js";
+import type { Workspace } from "../store/paths.js";
+import { fileContent, manifestMap, resolveRevision } from "../ingest/revision.js";
+import { gitNoIndexHunks } from "../ingest/diff.js";
+import fs from "node:fs";
+
+/**
+ * 受入計測ケースの生成(AIエージェントが判定を代行できる形式)。
+ * 判定に必要な証拠をすべて同梱し、判定基準(rubric)も添える。
+ * 出力を読んだAI(またはヒト)が verdict を返せば --submit で取り込める。
+ */
+
+export type EvalKind = "lineage" | "claims";
+
+export interface EvalCase {
+  case_id: string; // 判定対象の識別子(hunk_instance_id または claim_id)
+  kind: EvalKind;
+  question: string; // このケースで判定してほしいこと
+  subject: Record<string, unknown>; // 判定対象(ツールの主張)
+  evidence: Record<string, unknown>; // 判定に使う証拠(diff・発話・仕様など)
+  allowed_verdicts: string[];
+}
+
+export interface EvalCasePack {
+  schema_version: number;
+  kind: EvalKind;
+  generated_from: { base_revision_ref: string; head_revision_ref: string };
+  population: number;
+  sampled: number;
+  rubric: string[]; // 判定基準(AIが迷わないように明文化)
+  output_contract: Record<string, unknown>; // 返してほしいJSONの形
+  cases: EvalCase[];
+}
+
+const LINEAGE_RUBRIC = [
+  "この変更(hunk)を実際に作った編集イベントを、ツールが正しく特定できているかを判定してください。",
+  "correct = 帰属が事実と一致(linkedなら挙がっているイベントがこの変更を作った / uncapturedならhook外の変更である)。",
+  "incorrect = 事実と食い違う(別の編集に帰属している、捕捉済みなのにuncapturedとされている、など)。",
+  "unsure = 証拠が足りず判断できない。推測でcorrect/incorrectを付けないでください。",
+  "判定は提示された証拠のみに基づいてください。証拠にない事実を仮定しないこと。",
+];
+
+const CLAIMS_RUBRIC = [
+  "ツールが付けたclaim(由来の推定)の根拠が、その主張を支持しているかを判定してください。",
+  "correct = 提示された根拠がclaimの値を妥当に支持している(引用が実際に該当し、結論が飛躍していない)。",
+  "incorrect = 根拠が主張を支持していない(引用が無関係、結論が飛躍、値が明らかに誤り)。",
+  "unsure = 根拠が不足していて妥当性を判断できない。",
+  "値が『判定不能』のclaimは、そう判定したこと自体が妥当か(本当に判断材料がないか)を見てください。",
+];
+
+const OUTPUT_CONTRACT = {
+  format: "JSON",
+  shape: {
+    judgments: [{ case_id: "string", verdict: "correct | incorrect | unsure", reason: "string(短く根拠を書く)" }],
+  },
+  note: "cases配列と同じcase_idで返してください。判定できないものはunsureにし、省略しないでください。",
+};
+
+interface HunkRow {
+  hunk_instance_id: string;
+  file: string;
+  new_start: number;
+  new_lines: number;
+  old_start: number;
+  old_lines: number;
+  base_revision_ref: string;
+  head_revision_ref: string;
+  edit_capture_status: string | null;
+  lineage_status: string | null;
+  context_status: string | null;
+  confidence: number | null;
+}
+
+/** transcriptから指定行付近の発話を引用(証拠用) */
+function quoteAround(sessionRef: string, line: number | null, maxBack = 3): { role: string; line: number; text: string }[] {
+  if (!sessionRef || !fs.existsSync(sessionRef) || line === null) return [];
+  const lines = fs.readFileSync(sessionRef, "utf8").split("\n");
+  const out: { role: string; line: number; text: string }[] = [];
+  for (let i = Math.min(line, lines.length) - 1; i >= 0 && out.length < maxBack; i--) {
+    if (!lines[i]) continue;
+    try {
+      const o = JSON.parse(lines[i]);
+      const role = o?.message?.role ?? o?.role;
+      if (role !== "user" && role !== "assistant") continue;
+      const c = o?.message?.content ?? o?.content ?? "";
+      const text =
+        typeof c === "string" ? c : Array.isArray(c) ? c.map((x: { text?: string }) => x?.text ?? "").join(" ") : "";
+      if (text.trim()) out.push({ role, line: i + 1, text: text.slice(0, 400) });
+    } catch {
+      continue;
+    }
+  }
+  return out.reverse();
+}
+
+/** hunkの実diffを復元(証拠として提示するため) */
+function hunkDiffText(ws: Workspace, h: HunkRow): string {
+  try {
+    const base = resolveRevision(ws, h.base_revision_ref);
+    const head = resolveRevision(ws, h.head_revision_ref);
+    const b = manifestMap(base.manifest).get(h.file);
+    const hd = manifestMap(head.manifest).get(h.file);
+    const oldC = b ? fileContent(ws, b) : null;
+    const newC = hd ? fileContent(ws, hd) : null;
+    if (oldC === null && newC === null) return "(スナップショット未保存のためdiffを復元できません)";
+    const hunks = gitNoIndexHunks(oldC, newC);
+    const match = hunks.find((x) => x.newStart === h.new_start && x.newLines === h.new_lines);
+    const target = match ?? hunks[0];
+    if (!target) return "(該当hunkを復元できません)";
+    return [
+      `@@ -${target.oldStart},${target.oldLines} +${target.newStart},${target.newLines} @@`,
+      ...target.removedLines.map((l) => `-${l}`),
+      ...target.addedLines.map((l) => `+${l}`),
+    ].join("\n");
+  } catch (e) {
+    return `(diff復元不能: ${String(e)})`;
+  }
+}
+
+export function buildCasePack(ws: Workspace, kind: EvalKind, sample: number): EvalCasePack {
+  const db = openDbChecked(ws);
+  try {
+    const latest = db
+      .prepare("SELECT job_id, base_revision_ref, head_revision_ref FROM ingest_runs ORDER BY ts DESC, job_id DESC LIMIT 1")
+      .get() as { job_id: string; base_revision_ref: string; head_revision_ref: string } | undefined;
+    if (!latest) throw new ProvenError("empty", "ingestが未実行です。`proven ingest` を先に実行してください");
+
+    const cases: EvalCase[] = [];
+    let population = 0;
+
+    if (kind === "lineage") {
+      const rows = db
+        .prepare(
+          `SELECT hunk_instance_id, file, new_start, new_lines, old_start, old_lines,
+                  base_revision_ref, head_revision_ref, edit_capture_status, lineage_status, context_status, confidence
+           FROM hunks ORDER BY hunk_instance_id`,
+        )
+        .all() as HunkRow[];
+      population = rows.length;
+      for (const h of rows.slice(0, Math.min(sample, rows.length))) {
+        const links = db
+          .prepare(
+            `SELECT e.operation_id, e.agent, e.ts_pre, e.ts_post, e.session_ref, e.transcript_line, e.status
+             FROM lineage_links l JOIN edit_events e ON e.operation_id = l.operation_id
+             WHERE l.hunk_instance_id = ? ORDER BY e.ts_pre`,
+          )
+          .all(h.hunk_instance_id) as {
+          operation_id: string;
+          agent: string;
+          ts_pre: string;
+          ts_post: string | null;
+          session_ref: string;
+          transcript_line: number | null;
+          status: string;
+        }[];
+        // 同ファイルの他イベント(誤帰属を見抜くための対照証拠)
+        const otherEvents = db
+          .prepare(
+            `SELECT operation_id, ts_pre, status FROM edit_events
+             WHERE file = ? AND operation_id NOT IN (SELECT operation_id FROM lineage_links WHERE hunk_instance_id = ?)
+             ORDER BY ts_pre LIMIT 5`,
+          )
+          .all(h.file, h.hunk_instance_id) as { operation_id: string; ts_pre: string; status: string }[];
+        const causeClaim = db
+          .prepare("SELECT value, confidence, reason FROM claims WHERE hunk_ref=? AND kind='nolineage_cause'")
+          .get(h.hunk_instance_id) as { value: string; confidence: number; reason: string } | undefined;
+
+        cases.push({
+          case_id: h.hunk_instance_id,
+          kind: "lineage",
+          question:
+            h.edit_capture_status === "uncaptured"
+              ? "この変更は本当にhook外(手編集・formatter等)で作られたものですか? それとも挙がっていない捕捉済み編集が作ったものですか?"
+              : "この変更を作ったのは、ツールが挙げている編集イベントで正しいですか?",
+          subject: {
+            file: h.file,
+            location: `${h.file}:${h.new_start}`,
+            tool_says: {
+              edit_capture_status: h.edit_capture_status,
+              lineage_status: h.lineage_status,
+              context_status: h.context_status,
+              confidence: h.confidence,
+              attributed_events: links.map((l) => l.operation_id),
+            },
+            cause_claim: causeClaim ?? null,
+          },
+          evidence: {
+            hunk_diff: hunkDiffText(ws, h),
+            attributed_events: links.map((l) => ({
+              operation_id: l.operation_id,
+              agent: l.agent,
+              edited_at: l.ts_pre,
+              status: l.status,
+              transcript_quotes: quoteAround(l.session_ref, l.transcript_line),
+            })),
+            other_events_on_same_file: otherEvents,
+          },
+          allowed_verdicts: ["correct", "incorrect", "unsure"],
+        });
+      }
+    } else {
+      const rows = db
+        .prepare(
+          `SELECT c.claim_id, c.hunk_ref, c.kind, c.value, c.confidence, c.reason, c.evidence_json,
+                  h.file, h.new_start, h.new_lines, h.old_start, h.old_lines,
+                  h.base_revision_ref, h.head_revision_ref, h.edit_capture_status, h.lineage_status,
+                  h.context_status, h.confidence AS hconf
+           FROM claims c JOIN hunks h ON h.hunk_instance_id = c.hunk_ref
+           WHERE c.kind IN ('instructed','spec_support') ORDER BY c.claim_id`,
+        )
+        .all() as (HunkRow & {
+        claim_id: string;
+        hunk_ref: string;
+        kind: string;
+        value: string;
+        confidence: number;
+        reason: string;
+        evidence_json: string;
+        hconf: number | null;
+      })[];
+      population = rows.length;
+      for (const c of rows.slice(0, Math.min(sample, rows.length))) {
+        const evidence = JSON.parse(c.evidence_json) as { type: string; [k: string]: unknown }[];
+        const materialized = evidence.map((ev) => {
+          if (ev.type === "transcript") {
+            const q = quoteAround(ev.path as string, (ev.line as number) + 1, 1);
+            return { ...ev, quoted_text: q[0]?.text ?? "(引用元を復元できません)" };
+          }
+          if (ev.type === "spec") {
+            const db2 = openDbChecked(ws);
+            try {
+              const row = db2
+                .prepare("SELECT heading, tokens FROM spec_index WHERE file=? AND section=? LIMIT 1")
+                .get(ev.file as string, ev.section as string) as { heading: string; tokens: string } | undefined;
+              return { ...ev, spec_excerpt: row ? `${row.heading}: ${row.tokens.slice(0, 200)}` : "(仕様節を復元できません)" };
+            } finally {
+              db2.close();
+            }
+          }
+          return ev;
+        });
+        cases.push({
+          case_id: c.claim_id,
+          kind: "claims",
+          question: `このclaim(${c.kind}=${c.value})の根拠は、その主張を妥当に支持していますか?`,
+          subject: {
+            location: `${c.file}:${c.new_start}`,
+            claim_kind: c.kind,
+            claim_value: c.value,
+            confidence: c.confidence,
+            tool_reason: c.reason,
+          },
+          evidence: {
+            hunk_diff: hunkDiffText(ws, c),
+            claim_evidence: materialized,
+          },
+          allowed_verdicts: ["correct", "incorrect", "unsure"],
+        });
+      }
+    }
+
+    return {
+      schema_version: SCHEMA_VERSION,
+      kind,
+      generated_from: { base_revision_ref: latest.base_revision_ref, head_revision_ref: latest.head_revision_ref },
+      population,
+      sampled: cases.length,
+      rubric: kind === "lineage" ? LINEAGE_RUBRIC : CLAIMS_RUBRIC,
+      output_contract: OUTPUT_CONTRACT,
+      cases,
+    };
+  } finally {
+    db.close();
+  }
+}

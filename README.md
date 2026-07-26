@@ -16,6 +16,21 @@ proven ask src/x.ts:42 # 「なぜこの変更?」を記録に聞く
 proven precheck        # レビュー依頼前の自己チェック
 ```
 
+受入計測(精度検証)はAIエージェントに判定させられます。証拠つきのケースを出力し、AIの判定を取り込み、
+人間の確認と**区別して**集計します:
+
+```bash
+proven eval lineage --emit-cases --sample 50 > cases.json  # 判定用ケース(rubric・出力契約つき)
+# cases.jsonをAIエージェントに渡して判定させる → judgments.json
+proven eval lineage --submit judgments.json --judge ai --model claude-fable-5
+proven eval lineage --submit human.json --judge human      # 人間の確認
+proven eval lineage                                        # AI判定と人間確認を分けて集計
+```
+
+AI判定は`unverified`として記録され、受入基準(lineage 90% / claim 80%)の合否は**人間確認済みのみ**で
+判定します。AIが`unsure`/`incorrect`とした分は「人間が優先確認すべきケース」として提示され、
+AIと人間の判定が食い違えば不一致として一覧化されます。
+
 triageの実際の出力:
 
 ```
@@ -45,7 +60,7 @@ Node.js 20以上。SQLiteのネイティブモジュール(better-sqlite3)をビ
 
 ### 精度が未計測
 
-- **受入基準の実測をしていません。** 設計上の目標は「hunk→編集イベントの対応付け正解率90%以上」「claim根拠の妥当率80%以上」ですが、実プロジェクトでのサンプル検証は未実施です。
+- **受入基準の実測をしていません。** 設計上の目標は「hunk→編集イベントの対応付け正解率90%以上」「claim根拠の妥当率80%以上」ですが、実プロジェクトでのサンプル検証は未実施です(計測の仕組み自体は`proven eval`として実装済み)。
 - 由来判定(instructed / spec_support)はキーワード一致のヒューリスティックです。言い回しが指示と違えば「なし」に倒れます。誤判定の頻度は未計測です。
 - 仕様照合は仕様書に `REQ-xxx` 形式のIDがある前提で効きます。ID運用がないリポジトリでは「判定不能」が多くなります。
 
@@ -68,7 +83,7 @@ Node.js 20以上。SQLiteのネイティブモジュール(better-sqlite3)をビ
 
 ### 検証済みのこと
 
-- 自動テスト106件(vitest)が通ります。イベントストアからのprojection完全再構築、事実とclaimの峻別、プロンプトインジェクションの隔離、hookが開発をブロックしないこと、来歴チェーンの改ざん検知などを含みます。
+- 自動テスト114件(vitest)が通ります。イベントストアからのprojection完全再構築、事実とclaimの峻別、プロンプトインジェクションの隔離、hookが開発をブロックしないこと、来歴チェーンの改ざん検知などを含みます。
 - Proven自身のリポジトリでのドッグフーディングで、指示されていないAIの自律修正をunsolicited候補として検出し、実transcriptから当時のAI説明を引用できることを確認しました。
 - 同じドッグフーディングで実バグを2件見つけて直しました(ネストしたリポジトリでの捕捉先の誤り、日本語の指示とコンテンツが照合できない問題)。いずれも回帰テストつきです。
 
@@ -86,7 +101,7 @@ Node.js 20以上。SQLiteのネイティブモジュール(better-sqlite3)をビ
 ## テスト
 
 ```bash
-npm test        # vitest 106件
+npm test        # vitest 114件
 npm run typecheck
 ```
 

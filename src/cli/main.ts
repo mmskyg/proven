@@ -15,7 +15,6 @@ import { runPrecheck } from "../policy/precheck.js";
 import { rebuild } from "../store/projections.js";
 import { rotate, verifyDecisionsChain, eventFileSize } from "../store/events.js";
 import {
-  evalAccuracy,
   evalCaptureState,
   evalTriageLog,
   exportProvenance,
@@ -23,6 +22,8 @@ import {
   runPurge,
 } from "../store/maintenance.js";
 import { buildSpecIndex } from "../spec/index.js";
+import { buildCasePack } from "../eval/cases.js";
+import { reportEval, submitJudgments } from "../eval/judgments.js";
 import { ROTATE_SUGGEST_BYTES } from "../shared/types.js";
 
 interface OutputCtx {
@@ -454,38 +455,54 @@ evalCmd
       fail(ctx, "eval capture-state", e);
     }
   });
-evalCmd
-  .command("lineage")
-  .option("--sample <n>", "サンプル数", "50")
-  .option("--answers <path>", "正誤入力JSON({id: true/false})")
-  .action((opts: { sample: string; answers?: string }) => {
-    const ctx: OutputCtx = { json: false, warnings: [] };
-    try {
-      const ws = workspace(process.cwd());
-      requireInitialized(ws);
-      const answers = opts.answers ? JSON.parse(fs.readFileSync(opts.answers, "utf8")) : {};
-      const r = evalAccuracy(ws, "lineage", Number(opts.sample), answers);
-      emitResult(ctx, "eval lineage", "ok", r, r.lines);
-    } catch (e) {
-      fail(ctx, "eval lineage", e);
-    }
-  });
-evalCmd
-  .command("claims")
-  .option("--sample <n>", "サンプル数", "50")
-  .option("--answers <path>", "正誤入力JSON")
-  .action((opts: { sample: string; answers?: string }) => {
-    const ctx: OutputCtx = { json: false, warnings: [] };
-    try {
-      const ws = workspace(process.cwd());
-      requireInitialized(ws);
-      const answers = opts.answers ? JSON.parse(fs.readFileSync(opts.answers, "utf8")) : {};
-      const r = evalAccuracy(ws, "claims", Number(opts.sample), answers);
-      emitResult(ctx, "eval claims", "ok", r, r.lines);
-    } catch (e) {
-      fail(ctx, "eval claims", e);
-    }
-  });
+for (const kind of ["lineage", "claims"] as const) {
+  evalCmd
+    .command(kind)
+    .description(
+      kind === "lineage"
+        ? "lineage帰属の受入計測(--emit-casesで判定用ケースを出力→AIまたは人が判定→--submitで取込)"
+        : "claim根拠の受入計測(同上)",
+    )
+    .option("--emit-cases", "判定用ケースをJSONで出力(AIエージェントに渡す)", false)
+    .option("--sample <n>", "サンプル数", "50")
+    .option("--submit <path>", "判定JSONを取り込む")
+    .option("--judge <who>", "判定者: ai(未検証扱い) | human(確認済み扱い)", "human")
+    .option("--model <name>", "judge=ai のとき判定に使ったモデル名")
+    .option("--report", "集計(AI判定と人間確認を分離表示)", false)
+    .option("--json", "機械可読出力", false)
+    .action((opts: { emitCases: boolean; sample: string; submit?: string; judge: string; model?: string; report: boolean; json: boolean }) => {
+      const ctx: OutputCtx = { json: opts.json, warnings: [] };
+      const cmdName = `eval ${kind}`;
+      try {
+        const ws = workspace(process.cwd());
+        requireInitialized(ws);
+        if (opts.emitCases) {
+          // AIエージェントがそのまま読める形式。--json有無に関わらずstdoutはJSONのみ
+          const pack = buildCasePack(ws, kind, Number(opts.sample));
+          process.stdout.write(JSON.stringify(pack, null, 2) + "\n");
+          return;
+        }
+        if (opts.submit) {
+          if (opts.judge !== "ai" && opts.judge !== "human") throw new ProvenError("input", "--judge は ai | human");
+          const r = submitJudgments(ws, kind, opts.submit, {
+            judge: opts.judge,
+            actorId: actorId(ws.provenDir, ws.repoRoot),
+            model: opts.model,
+          });
+          if (r.unknownCases.length) ctx.warnings.push(`未知のcase_id ${r.unknownCases.length}件を無視しました`);
+          emitResult(ctx, cmdName, "ok", r, [
+            `判定を${r.accepted}件記録しました(${r.verificationLevel})`,
+            ...(opts.judge === "ai" ? ["※AI判定は未検証です。受入合否には人間確認が必要です"] : []),
+          ]);
+          return;
+        }
+        const rep = reportEval(ws, kind);
+        emitResult(ctx, cmdName, "ok", rep, rep.lines);
+      } catch (e) {
+        fail(ctx, cmdName, e);
+      }
+    });
+}
 evalCmd
   .command("triage-log")
   .option("--reached <bool>", "今日のレビューで重要変更に先に到達できたか(true/false)")
