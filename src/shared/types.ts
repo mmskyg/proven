@@ -125,6 +125,12 @@ export interface ClaimEmitted {
   confidence: number;
   reason: string;
   evidence_refs: EvidenceRef[];
+  /** 導出方式(REQ-805)。未設定は heuristic 相当(既存イベントとの互換) */
+  method?: "heuristic" | "llm";
+  /** method=llm のとき: 使用モデル・プロンプトのdigest・送信範囲 */
+  model?: string;
+  prompt_digest?: string;
+  input_scope?: Record<string, number>;
 }
 
 export interface Finding {

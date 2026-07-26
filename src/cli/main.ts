@@ -24,6 +24,7 @@ import {
 } from "../store/maintenance.js";
 import { buildSpecIndex } from "../spec/index.js";
 import { buildCasePack } from "../eval/cases.js";
+import { runLlmJudge } from "../llm/run.js";
 import { reportEval, submitJudgments } from "../eval/judgments.js";
 import { ROTATE_SUGGEST_BYTES } from "../shared/types.js";
 
@@ -324,6 +325,29 @@ program
       if (r.gate) process.exit(10);
     } catch (e) {
       fail(ctx, "precheck", e);
+    }
+  });
+
+program
+  .command("llm-judge")
+  .description("LLM第二段判定(既定OFF・判定不能のclaimのみ対象)")
+  .option("--limit <n>", "判定する最大件数")
+  .option("--json", "機械可読出力", false)
+  .action(async (opts: { limit?: string; json: boolean }) => {
+    const ctx: OutputCtx = { json: opts.json, warnings: [] };
+    try {
+      const ws = workspace(process.cwd());
+      requireInitialized(ws);
+      const r = await runLlmJudge(ws, { limit: opts.limit ? Number(opts.limit) : undefined });
+      ctx.warnings = r.warnings;
+      emitResult(ctx, "llm-judge", "ok", r, [
+        r.enabled
+          ? `LLM判定: 対象${r.targets}件 / 判定${r.judged}件 (断定${r.determinate} / 破棄${r.discarded}) ` +
+            `呼び出し${r.calls}回 / 概算$${r.spentUsd}`
+          : "LLM層は無効です",
+      ]);
+    } catch (e) {
+      fail(ctx, "llm-judge", e);
     }
   });
 

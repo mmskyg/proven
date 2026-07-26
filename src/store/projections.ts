@@ -42,7 +42,8 @@ CREATE TABLE IF NOT EXISTS lineage_links (hunk_instance_id TEXT, operation_id TE
   support TEXT,
   PRIMARY KEY(hunk_instance_id, operation_id));
 CREATE TABLE IF NOT EXISTS claims (claim_id TEXT PRIMARY KEY, hunk_ref TEXT, kind TEXT,
-  value TEXT, confidence REAL, reason TEXT, run_id TEXT, evidence_json TEXT);
+  value TEXT, confidence REAL, reason TEXT, run_id TEXT, evidence_json TEXT,
+  method TEXT, model TEXT, prompt_digest TEXT);
 CREATE INDEX IF NOT EXISTS idx_claims_hunk ON claims(hunk_ref, kind);
 CREATE TABLE IF NOT EXISTS origin_confirmed (hunk_ref TEXT, attribute TEXT, confirmed_value TEXT,
   actor_id TEXT, ts TEXT, PRIMARY KEY(hunk_ref, attribute));
@@ -58,6 +59,15 @@ CREATE TABLE IF NOT EXISTS eval_judgments (judgment_id TEXT PRIMARY KEY, kind TE
   verdict TEXT, reason TEXT, judge TEXT, actor_id TEXT, model TEXT, verification_level TEXT, ts TEXT);
 CREATE INDEX IF NOT EXISTS idx_eval_case ON eval_judgments(kind, case_id, judge);
 `;
+
+/** claims.method/model/prompt_digest 列の追加(REQ-805)。既存DBは非破壊でALTER */
+function migrateClaims(db: Sqlite.Database): void {
+  const cols = db.prepare("PRAGMA table_info(claims)").all() as { name: string }[];
+  if (cols.length === 0 || cols.some((c) => c.name === "method")) return;
+  db.exec("ALTER TABLE claims ADD COLUMN method TEXT");
+  db.exec("ALTER TABLE claims ADD COLUMN model TEXT");
+  db.exec("ALTER TABLE claims ADD COLUMN prompt_digest TEXT");
+}
 
 /** lineage_links.support 列の追加(REQ-503)。既存DBは非破壊でALTER */
 function migrateLineageLinks(db: Sqlite.Database): void {
@@ -100,6 +110,7 @@ export function openDb(ws: Workspace): Sqlite.Database {
     db.exec(DDL);
     migrateEditEvents(db);
     migrateLineageLinks(db);
+    migrateClaims(db);
     db.exec("CREATE VIRTUAL TABLE IF NOT EXISTS spec_fts USING fts5(req_id, heading, body, file, section)");
   } catch (e) {
     db.close();
@@ -219,10 +230,21 @@ export function applyEvent(db: Sqlite.Database, env: EventEnvelope): void {
     }
     case "claim_emitted": {
       const p = env.payload as ClaimEmitted;
+      // LLM判定(第二段)は、同じhunk・同じkindのヒューリスティック行を置き換える(REQ-801/805)。
+      // イベントは両方残るが、現在値としてはLLMの判定を採る
+      if (p.method === "llm") {
+        db.prepare("DELETE FROM claims WHERE hunk_ref=? AND kind=? AND (method IS NULL OR method<>'llm')").run(
+          p.hunk_ref,
+          p.kind,
+        );
+      }
       db.prepare(
-        `INSERT INTO claims(claim_id, hunk_ref, kind, value, confidence, reason, run_id, evidence_json)
-         VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(claim_id) DO NOTHING`,
-      ).run(p.claim_id, p.hunk_ref, p.kind, p.value, p.confidence, p.reason, p.run_id, JSON.stringify(p.evidence_refs));
+        `INSERT INTO claims(claim_id, hunk_ref, kind, value, confidence, reason, run_id, evidence_json, method, model, prompt_digest)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(claim_id) DO NOTHING`,
+      ).run(
+        p.claim_id, p.hunk_ref, p.kind, p.value, p.confidence, p.reason, p.run_id, JSON.stringify(p.evidence_refs),
+        p.method ?? "heuristic", p.model ?? null, p.prompt_digest ?? null,
+      );
       break;
     }
     case "finding": {
