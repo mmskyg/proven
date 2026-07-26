@@ -63,6 +63,9 @@ const CLAIMS_RUBRIC = [
   "evidence.context に、その変更の捕捉状態・transcriptの可読性・仕様索引の有無が入っています。" +
     "『判定不能』が妥当かはこれで確認してください(例: 捕捉されていないなら会話と照合できないのは事実)。",
   "spec_excerpt は仕様書の実際の本文です。claimが指す要求と、変更内容が実際に対応しているかを見てください。",
+  // REQ-606: contextは現在の状態。過去のclaimとの食い違いを誤りと即断させない
+  "context は『現在』の状態です。from_latest_ingest が false のclaimは過去に付与されたもので、" +
+    "当時の状態は記録されていません。現在の状態との食い違いだけを理由にincorrectとしないでください。",
 ];
 
 const OUTPUT_CONTRACT = {
@@ -159,7 +162,11 @@ function truncateDiff(text: string): string {
  * 「判定不能」の理由が事実かどうか(本当に捕捉されていないのか、transcriptが読めないのか、
  * 仕様索引が空なのか)を判定者が確認できるようにする。
  */
-function claimContext(ws: Workspace, h: HunkRow & { hunk_ref: string }): Record<string, unknown> {
+function claimContext(
+  ws: Workspace,
+  h: HunkRow & { hunk_ref: string; ingest_job_id: string | null },
+  latestJobId: string,
+): Record<string, unknown> {
   const db = openDbChecked(ws);
   try {
     const links = db
@@ -170,13 +177,19 @@ function claimContext(ws: Workspace, h: HunkRow & { hunk_ref: string }): Record<
       )
       .all(h.hunk_ref) as { operation_id: string; session_ref: string; transcript_line: number | null }[];
     const spec = db.prepare("SELECT COUNT(*) c, COUNT(req_id) r FROM spec_index").get() as { c: number; r: number };
+    // REQ-606: contextは「現在」の状態。claim付与時点と食い違いうるので、それを明示する
+    const fromLatestIngest = h.ingest_job_id === latestJobId;
     return {
       edit_capture_status: h.edit_capture_status,
       lineage_status: h.lineage_status,
       context_status: h.context_status,
       attributed_event_count: links.length,
       transcript_available: links.some((l) => l.session_ref && l.transcript_line !== null && fs.existsSync(l.session_ref)),
-      spec_index: { paragraphs: spec.c, with_req_id: spec.r },
+      spec_index_current: { paragraphs: spec.c, with_req_id: spec.r },
+      from_latest_ingest: fromLatestIngest,
+      note: fromLatestIngest
+        ? "このclaimは最新のingestで付与されたもので、上の状態と時点が一致します"
+        : "このclaimは過去のingestで付与されたものです。上の状態は現在の値であり、claim付与時点とは異なる可能性があります(当時の状態は記録していません)",
     };
   } finally {
     db.close();
@@ -381,7 +394,7 @@ export function buildCasePack(ws: Workspace, kind: EvalKind, sample: number): Ev
       const rows = db
         .prepare(
           `SELECT c.claim_id, c.hunk_ref, c.kind, c.value, c.confidence, c.reason, c.evidence_json,
-                  h.file, h.new_start, h.new_lines, h.old_start, h.old_lines,
+                  h.file, h.new_start, h.new_lines, h.old_start, h.old_lines, h.ingest_job_id,
                   h.base_revision_ref, h.head_revision_ref, h.edit_capture_status, h.lineage_status,
                   h.context_status, h.confidence AS hconf
            FROM claims c JOIN hunks h ON h.hunk_instance_id = c.hunk_ref
@@ -396,6 +409,7 @@ export function buildCasePack(ws: Workspace, kind: EvalKind, sample: number): Ev
         reason: string;
         evidence_json: string;
         hconf: number | null;
+        ingest_job_id: string | null;
       })[];
       population = rows.length;
       for (const c of rows.slice(0, Math.min(sample, rows.length))) {
@@ -440,7 +454,7 @@ export function buildCasePack(ws: Workspace, kind: EvalKind, sample: number): Ev
             hunk_diff: truncateDiff(hunkDiffText(ws, c)),
             claim_evidence: materialized,
             // REQ-602: 「判定不能」が妥当かを判定者が確かめられるようにする判断材料
-            context: claimContext(ws, c),
+            context: claimContext(ws, c, latest.job_id),
           },
           allowed_verdicts: ["correct", "incorrect", "unsure"],
         });

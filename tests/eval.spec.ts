@@ -412,7 +412,10 @@ describe("claim証拠の強化(REQ-601/602/604)", () => {
     expect(ctx).toBeDefined();
     expect(ctx).toHaveProperty("edit_capture_status");
     expect(ctx).toHaveProperty("transcript_available");
-    expect(ctx).toHaveProperty("spec_index");
+    expect(ctx).toHaveProperty("spec_index_current");
+    // REQ-606: contextは現在の状態なので、claimの時点と一致するかを明示する
+    expect(ctx).toHaveProperty("from_latest_ingest");
+    expect(String(ctx.note)).toContain("時点");
   });
 
   it("REQ-604: 長いdiffは打ち切られる", () => {
