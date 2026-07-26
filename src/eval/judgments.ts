@@ -17,6 +17,12 @@ import type { EvalKind } from "./cases.js";
 export type Verdict = "correct" | "incorrect" | "unsure";
 export type Judge = "ai" | "human";
 
+/**
+ * 受入PASSを出すのに必要な人間確認済み判定の最低件数(REQ-305)。
+ * n=1で「PASS」と出すと、測れていないものを測れたように見せてしまうため。
+ */
+export const MIN_HUMAN_SAMPLE = 20;
+
 const JudgmentsSchema = z.object({
   judgments: z
     .array(
@@ -166,19 +172,25 @@ export function reportEval(ws: Workspace, kind: EvalKind): EvalReport {
 
     const threshold = kind === "lineage" ? 0.9 : 0.8;
     const humanDecided = human.correct + human.incorrect;
-    const acceptancePassed = humanDecided === 0 ? null : human.correct / humanDecided >= threshold;
+    const meetsThreshold = humanDecided === 0 ? null : human.correct / humanDecided >= threshold;
+    // REQ-305: サンプルが少ないうちはPASSを出さない。基準割れ(FAIL)は少数でも事実として出す
+    const acceptancePassed =
+      meetsThreshold === null ? null : meetsThreshold && humanDecided < MIN_HUMAN_SAMPLE ? null : meetsThreshold;
+
+    const verdictText =
+      acceptancePassed === null
+        ? humanDecided === 0
+          ? "判定不能(人間確認済みの判定がありません)"
+          : `判定不能(サンプル不足 ${humanDecided}/${MIN_HUMAN_SAMPLE}件。基準は満たしているが件数が足りません)`
+        : acceptancePassed
+          ? "PASS"
+          : "FAIL";
 
     const lines = [
       `対象母集団: ${population}件`,
       `AI判定(unverified): ${ai.judged}件 — 正解率 ${ai.rate} (unsure ${ai.unsure}件は母数外)`,
       `人間確認済み(human-confirmed): ${human.judged}件 — 正解率 ${human.rate} (unsure ${human.unsure}件は母数外)`,
-      `受入基準(${kind === "lineage" ? "lineage 90%" : "claim 80%"}): ${
-        acceptancePassed === null
-          ? "判定不能(人間確認済みの判定がありません)"
-          : acceptancePassed
-            ? "PASS"
-            : "FAIL"
-      }`,
+      `受入基準(${kind === "lineage" ? "lineage 90%" : "claim 80%"}): ${verdictText}`,
       `※AI判定は検証済みではありません(設計原則2)。受入合否は人間確認済みのみで判定しています。`,
     ];
     if (disagreements.length) lines.push(`AIと人間の不一致: ${disagreements.length}件 → ${disagreements.map((d) => d.case_id.slice(0, 8)).join(", ")}`);

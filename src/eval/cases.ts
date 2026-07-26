@@ -41,6 +41,11 @@ const LINEAGE_RUBRIC = [
   "incorrect = 事実と食い違う(別の編集に帰属している、捕捉済みなのにuncapturedとされている、など)。",
   "unsure = 証拠が足りず判断できない。推測でcorrect/incorrectを付けないでください。",
   "判定は提示された証拠のみに基づいてください。証拠にない事実を仮定しないこと。",
+  // REQ-304: 帰属判定は会話ではなくblobチェーンで行っているため、機械的証拠を主とする
+  "主たる証拠は attribution_basis です。これは編集前後の内容ハッシュ(blobチェーン)と、そのイベント自身が作った差分です。",
+  "attribution_basis.overlap が full/partial なら、そのイベントがhunkの変更行を実際に作ったことを意味します。",
+  "会話引用(transcript_quotes)は補助証拠です。引用が無いこと自体はunsureの理由になりません(帰属判定は会話に依存しません)。",
+  "other_events_on_same_file は対照証拠です。非帰属イベントの方がhunkをよく説明できる場合はincorrectを検討してください。",
 ];
 
 const CLAIMS_RUBRIC = [
@@ -96,8 +101,8 @@ function quoteAround(sessionRef: string, line: number | null, maxBack = 3): { ro
   return out.reverse();
 }
 
-/** hunkの実diffを復元(証拠として提示するため) */
-function hunkDiffText(ws: Workspace, h: HunkRow): string {
+/** hunkの実体(変更行)を復元。証拠テキストと機械的証拠の突き合わせに使う */
+function resolveHunk(ws: Workspace, h: HunkRow): { addedLines: string[]; removedLines: string[]; text: string } {
   try {
     const base = resolveRevision(ws, h.base_revision_ref);
     const head = resolveRevision(ws, h.head_revision_ref);
@@ -105,19 +110,96 @@ function hunkDiffText(ws: Workspace, h: HunkRow): string {
     const hd = manifestMap(head.manifest).get(h.file);
     const oldC = b ? fileContent(ws, b) : null;
     const newC = hd ? fileContent(ws, hd) : null;
-    if (oldC === null && newC === null) return "(スナップショット未保存のためdiffを復元できません)";
+    if (oldC === null && newC === null) {
+      return { addedLines: [], removedLines: [], text: "(スナップショット未保存のためdiffを復元できません)" };
+    }
     const hunks = gitNoIndexHunks(oldC, newC);
     const match = hunks.find((x) => x.newStart === h.new_start && x.newLines === h.new_lines);
     const target = match ?? hunks[0];
-    if (!target) return "(該当hunkを復元できません)";
-    return [
-      `@@ -${target.oldStart},${target.oldLines} +${target.newStart},${target.newLines} @@`,
-      ...target.removedLines.map((l) => `-${l}`),
-      ...target.addedLines.map((l) => `+${l}`),
-    ].join("\n");
+    if (!target) return { addedLines: [], removedLines: [], text: "(該当hunkを復元できません)" };
+    return {
+      addedLines: target.addedLines,
+      removedLines: target.removedLines,
+      text: [
+        `@@ -${target.oldStart},${target.oldLines} +${target.newStart},${target.newLines} @@`,
+        ...target.removedLines.map((l) => `-${l}`),
+        ...target.addedLines.map((l) => `+${l}`),
+      ].join("\n"),
+    };
   } catch (e) {
-    return `(diff復元不能: ${String(e)})`;
+    return { addedLines: [], removedLines: [], text: `(diff復元不能: ${String(e)})` };
   }
+}
+
+/** hunkの実diffを復元(証拠として提示するため) */
+function hunkDiffText(ws: Workspace, h: HunkRow): string {
+  return resolveHunk(ws, h).text;
+}
+
+const EVENT_DIFF_MAX_LINES = 20;
+
+export interface AttributionBasis {
+  pre_blob: string | null;
+  post_blob: string | null;
+  event_diff: string;
+  introduced_lines: string[];
+  removed_lines: string[];
+  overlap: "full" | "partial" | "none" | "unknown";
+}
+
+/**
+ * 帰属判定が実際に使っている機械的証拠を組み立てる(REQ-301/302)。
+ * 編集イベントのpre/post内容から、そのイベント自身が作った差分を復元し、
+ * hunkの変更行をどれだけ説明できるか(overlap)を出す。
+ * 会話引用ではなくこれが帰属の根拠なので、判定者はこれを見て検証できる。
+ */
+export function attributionBasis(
+  ws: Workspace,
+  ev: { pre_blob_hash: string | null; result_blob_hash: string | null },
+  hunk: { addedLines: string[]; removedLines: string[] },
+): AttributionBasis {
+  const short = (h: string | null): string | null => (h ? h.slice(0, 12) : null);
+  const pre = ev.pre_blob_hash ? getObject(ws, ev.pre_blob_hash)?.toString("utf8") ?? null : "";
+  const post = ev.result_blob_hash ? getObject(ws, ev.result_blob_hash)?.toString("utf8") ?? null : "";
+  if (pre === null || post === null) {
+    return {
+      pre_blob: short(ev.pre_blob_hash),
+      post_blob: short(ev.result_blob_hash),
+      event_diff: "(スナップショットが残っていないため、このイベントの差分を復元できません)",
+      introduced_lines: [],
+      removed_lines: [],
+      overlap: "unknown",
+    };
+  }
+  const evHunks = gitNoIndexHunks(pre, post);
+  const evAdded = new Set(evHunks.flatMap((x) => x.addedLines));
+  const evRemoved = new Set(evHunks.flatMap((x) => x.removedLines));
+  const introduced = hunk.addedLines.filter((l) => evAdded.has(l));
+  const removed = hunk.removedLines.filter((l) => evRemoved.has(l));
+  const changedTotal = hunk.addedLines.length + hunk.removedLines.length;
+  const matched = introduced.length + removed.length;
+  const overlap: AttributionBasis["overlap"] =
+    changedTotal === 0 ? "unknown" : matched === 0 ? "none" : matched >= changedTotal ? "full" : "partial";
+
+  const diffLines: string[] = [];
+  for (const x of evHunks) {
+    diffLines.push(`@@ -${x.oldStart},${x.oldLines} +${x.newStart},${x.newLines} @@`);
+    for (const l of x.removedLines) diffLines.push(`-${l}`);
+    for (const l of x.addedLines) diffLines.push(`+${l}`);
+    if (diffLines.length > EVENT_DIFF_MAX_LINES) break;
+  }
+  const truncated = diffLines.length > EVENT_DIFF_MAX_LINES;
+  return {
+    pre_blob: short(ev.pre_blob_hash),
+    post_blob: short(ev.result_blob_hash),
+    event_diff:
+      diffLines.length === 0
+        ? "(このイベントは内容を変更していません)"
+        : diffLines.slice(0, EVENT_DIFF_MAX_LINES).join("\n") + (truncated ? "\n…(以下省略)" : ""),
+    introduced_lines: introduced,
+    removed_lines: removed,
+    overlap,
+  };
 }
 
 export function buildCasePack(ws: Workspace, kind: EvalKind, sample: number): EvalCasePack {
@@ -141,13 +223,15 @@ export function buildCasePack(ws: Workspace, kind: EvalKind, sample: number): Ev
         .all() as HunkRow[];
       population = rows.length;
       for (const h of rows.slice(0, Math.min(sample, rows.length))) {
+        // 1操作N ファイルに対応するため、イベントは (operation_id, file) で絞る
         const links = db
           .prepare(
-            `SELECT e.operation_id, e.agent, e.ts_pre, e.ts_post, e.session_ref, e.transcript_line, e.status
+            `SELECT e.operation_id, e.agent, e.ts_pre, e.ts_post, e.session_ref, e.transcript_line, e.status,
+                    e.pre_blob_hash, e.result_blob_hash
              FROM lineage_links l JOIN edit_events e ON e.operation_id = l.operation_id
-             WHERE l.hunk_instance_id = ? ORDER BY e.ts_pre`,
+             WHERE l.hunk_instance_id = ? AND e.file = ? ORDER BY e.ts_pre`,
           )
-          .all(h.hunk_instance_id) as {
+          .all(h.hunk_instance_id, h.file) as {
           operation_id: string;
           agent: string;
           ts_pre: string;
@@ -155,15 +239,24 @@ export function buildCasePack(ws: Workspace, kind: EvalKind, sample: number): Ev
           session_ref: string;
           transcript_line: number | null;
           status: string;
+          pre_blob_hash: string | null;
+          result_blob_hash: string | null;
         }[];
         // 同ファイルの他イベント(誤帰属を見抜くための対照証拠)
         const otherEvents = db
           .prepare(
-            `SELECT operation_id, ts_pre, status FROM edit_events
+            `SELECT operation_id, ts_pre, status, pre_blob_hash, result_blob_hash FROM edit_events
              WHERE file = ? AND operation_id NOT IN (SELECT operation_id FROM lineage_links WHERE hunk_instance_id = ?)
              ORDER BY ts_pre LIMIT 5`,
           )
-          .all(h.file, h.hunk_instance_id) as { operation_id: string; ts_pre: string; status: string }[];
+          .all(h.file, h.hunk_instance_id) as {
+          operation_id: string;
+          ts_pre: string;
+          status: string;
+          pre_blob_hash: string | null;
+          result_blob_hash: string | null;
+        }[];
+        const hunkBody = resolveHunk(ws, h);
         const causeClaim = db
           .prepare("SELECT value, confidence, reason FROM claims WHERE hunk_ref=? AND kind='nolineage_cause'")
           .get(h.hunk_instance_id) as { value: string; confidence: number; reason: string } | undefined;
@@ -188,15 +281,23 @@ export function buildCasePack(ws: Workspace, kind: EvalKind, sample: number): Ev
             cause_claim: causeClaim ?? null,
           },
           evidence: {
-            hunk_diff: hunkDiffText(ws, h),
+            hunk_diff: hunkBody.text,
+            // 帰属判定の実体はblobチェーン。会話引用は補助(REQ-301/302/304)
             attributed_events: links.map((l) => ({
               operation_id: l.operation_id,
               agent: l.agent,
               edited_at: l.ts_pre,
               status: l.status,
+              attribution_basis: attributionBasis(ws, l, hunkBody),
               transcript_quotes: quoteAround(l.session_ref, l.transcript_line),
             })),
-            other_events_on_same_file: otherEvents,
+            // 対照証拠にも同じ機械的証拠を付ける(REQ-303)
+            other_events_on_same_file: otherEvents.map((o) => ({
+              operation_id: o.operation_id,
+              edited_at: o.ts_pre,
+              status: o.status,
+              attribution_basis: attributionBasis(ws, o, hunkBody),
+            })),
           },
           allowed_verdicts: ["correct", "incorrect", "unsure"],
         });

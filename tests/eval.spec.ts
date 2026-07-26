@@ -95,6 +95,109 @@ describe("emit-cases(AIエージェント連携契約)", () => {
   });
 });
 
+describe("受入合否の最低サンプル数(REQ-305)", () => {
+  /** 25ファイルを1つずつ捕捉つきで編集し、25 hunkの母集団を作る */
+  function bigScenario(): string[] {
+    fx = makeRepo(Object.fromEntries(Array.from({ length: 25 }, (_, i) => [`src/f${i}.ts`, "a\n"])));
+    initProven(fx);
+    for (let i = 0; i < 25; i++) capturedEdit(fx, `src/f${i}.ts`, `a\nb${i}\n`);
+    runIngest(fx.ws);
+    const db = openDb(fx.ws);
+    const ids = (db.prepare("SELECT hunk_instance_id AS id FROM hunks ORDER BY id").all() as { id: string }[]).map((r) => r.id);
+    db.close();
+    return ids;
+  }
+
+  it("20件未満はPASSを出さず「サンプル不足」と表示する", () => {
+    const ids = bigScenario();
+    submitJudgments(
+      fx.ws,
+      "lineage",
+      writeJudgments(ids.slice(0, 19).map((id) => ({ case_id: id, verdict: "correct" }))),
+      { judge: "human", actorId: "akita" },
+    );
+    const r = reportEval(fx.ws, "lineage");
+    expect(r.human.correct).toBe(19);
+    expect(r.acceptancePassed).toBeNull();
+    expect(r.lines.join("\n")).toContain("サンプル不足 19/20");
+    expect(r.lines.join("\n")).not.toContain("PASS");
+  });
+
+  it("20件以上で基準を満たせばPASSになる", () => {
+    const ids = bigScenario();
+    submitJudgments(
+      fx.ws,
+      "lineage",
+      writeJudgments(ids.slice(0, 20).map((id) => ({ case_id: id, verdict: "correct" }))),
+      { judge: "human", actorId: "akita" },
+    );
+    const r = reportEval(fx.ws, "lineage");
+    expect(r.acceptancePassed).toBe(true);
+    expect(r.lines.join("\n")).toContain("PASS");
+  });
+
+  it("基準割れは件数が少なくてもFAILとして出す(事実は隠さない)", () => {
+    const ids = bigScenario();
+    submitJudgments(
+      fx.ws,
+      "lineage",
+      writeJudgments([
+        { case_id: ids[0], verdict: "correct" },
+        { case_id: ids[1], verdict: "incorrect" },
+      ]),
+      { judge: "human", actorId: "akita" },
+    );
+    const r = reportEval(fx.ws, "lineage");
+    expect(r.acceptancePassed).toBe(false);
+    expect(r.lines.join("\n")).toContain("FAIL");
+  });
+});
+
+describe("帰属の機械的証拠(REQ-301〜303)", () => {
+  it("lineageケースにblobチェーン由来のattribution_basisが入る", () => {
+    scenario();
+    const pack = buildCasePack(fx.ws, "lineage", 50);
+    const captured = pack.cases.find(
+      (c) => (c.subject as { tool_says: { edit_capture_status: string } }).tool_says.edit_capture_status === "captured",
+    );
+    expect(captured).toBeDefined();
+    const evs = (
+      captured!.evidence as {
+        attributed_events: { attribution_basis: { overlap: string; introduced_lines: string[]; event_diff: string; pre_blob: string | null } }[];
+      }
+    ).attributed_events;
+    expect(evs.length).toBeGreaterThan(0);
+    const basis = evs[0].attribution_basis;
+    // 帰属イベントはhunkの追加行を実際に作っているので overlap は full/partial
+    expect(["full", "partial"]).toContain(basis.overlap);
+    expect(basis.introduced_lines.length).toBeGreaterThan(0);
+    expect(basis.event_diff).toMatch(/^@@/);
+    expect(basis.pre_blob).not.toBeNull();
+  });
+
+  it("対照用の非帰属イベントにも同じ機械的証拠が付く", () => {
+    fx = makeRepo({ "src/a.ts": "l1\nl2\n" });
+    initProven(fx);
+    capturedEdit(fx, "src/a.ts", "l1\nl2\nadded-by-first\n");
+    capturedEdit(fx, "src/other.ts", "x\n");
+    runIngest(fx.ws);
+    const pack = buildCasePack(fx.ws, "lineage", 50);
+    const target = pack.cases.find((c) => (c.subject as { file: string }).file === "src/a.ts");
+    expect(target).toBeDefined();
+    const others = (
+      target!.evidence as { other_events_on_same_file: { attribution_basis?: { overlap: string } }[] }
+    ).other_events_on_same_file;
+    for (const o of others) expect(o.attribution_basis).toBeDefined();
+  });
+
+  it("rubricが機械的証拠を主・会話引用を補助と明示する(REQ-304)", () => {
+    scenario();
+    const rubric = buildCasePack(fx.ws, "lineage", 5).rubric.join("\n");
+    expect(rubric).toContain("attribution_basis");
+    expect(rubric).toContain("引用が無いこと自体はunsureの理由になりません");
+  });
+});
+
 describe("submit/report(検証の格付け=設計原則2)", () => {
   it("AI判定はunverified・人間判定はhuman-confirmedとして区別記録される", () => {
     const { hunkIds } = scenario();
@@ -134,8 +237,10 @@ describe("submit/report(検証の格付け=設計原則2)", () => {
       actorId: "akita",
     });
     const r2 = reportEval(fx.ws, "lineage");
-    expect(r2.acceptancePassed).toBe(true);
+    // REQ-305: 基準は満たしていても最低サンプル数(20件)に届かないうちはPASSを出さない
     expect(r2.human.rate).toContain("100.0%");
+    expect(r2.acceptancePassed).toBeNull();
+    expect(r2.lines.join("\n")).toContain("サンプル不足");
   });
 
   it("unsureは母数から除外され、AIと人間の不一致・要確認ケースが提示される", () => {
