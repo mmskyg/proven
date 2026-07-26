@@ -383,3 +383,48 @@ describe("submit/report(検証の格付け=設計原則2)", () => {
     expect(r.unknownCases).toEqual(["deadbeef-unknown"]);
   });
 });
+
+describe("claim証拠の強化(REQ-601/602/604)", () => {
+  it("REQ-601: spec_excerptがトークン列ではなく仕様書の実本文になる", () => {
+    scenario();
+    const pack = buildCasePack(fx.ws, "claims", 50);
+    const withSpec = pack.cases.find((c) =>
+      ((c.evidence as { claim_evidence: Record<string, unknown>[] }).claim_evidence ?? []).some(
+        (e) => e.type === "spec",
+      ),
+    );
+    expect(withSpec).toBeDefined();
+    const ev = (withSpec!.evidence as { claim_evidence: Record<string, unknown>[] }).claim_evidence.find(
+      (e) => e.type === "spec",
+    )!;
+    const excerpt = ev.spec_excerpt as string;
+    expect(excerpt).toContain("REQ-001"); // 実本文にはREQ-IDがそのまま入る
+    expect(excerpt).toContain("cacheLayer");
+    expect(excerpt).not.toMatch(/ケー ーシ シュ/); // 2-gramトークン列になっていない
+  });
+
+  it("REQ-602: 判定不能の妥当性を確かめるcontextが付く", () => {
+    scenario();
+    const pack = buildCasePack(fx.ws, "claims", 50);
+    const indeterminate = pack.cases.find((c) => (c.subject as { claim_value: string }).claim_value === "判定不能");
+    expect(indeterminate).toBeDefined();
+    const ctx = (indeterminate!.evidence as { context: Record<string, unknown> }).context;
+    expect(ctx).toBeDefined();
+    expect(ctx).toHaveProperty("edit_capture_status");
+    expect(ctx).toHaveProperty("transcript_available");
+    expect(ctx).toHaveProperty("spec_index");
+  });
+
+  it("REQ-604: 長いdiffは打ち切られる", () => {
+    fx = makeRepo({ "docs/spec.md": "# s\n\nREQ-001 要件。" });
+    initProven(fx);
+    capturedEdit(fx, "src/big.ts", Array.from({ length: 200 }, (_, i) => `line-${i}`).join("\n") + "\n");
+    runIngest(fx.ws);
+    const pack = buildCasePack(fx.ws, "claims", 50);
+    const big = pack.cases.find((c) => (c.subject as { location: string }).location.startsWith("src/big.ts"));
+    expect(big).toBeDefined();
+    const diff = (big!.evidence as { hunk_diff: string }).hunk_diff;
+    expect(diff.split("\n").length).toBeLessThanOrEqual(41);
+    expect(diff).toContain("行省略");
+  });
+});

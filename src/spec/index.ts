@@ -75,6 +75,26 @@ export function buildSpecIndex(ws: Workspace): SpecIndexResult {
   return { files: files.length, paragraphs, reqIds: reqSet.size };
 }
 
+/**
+ * section識別子(`<file>#p<N>`)から仕様書の該当段落本文を復元する(REQ-601)。
+ * spec_indexはトークン列とハッシュしか持たないため、証拠提示にはファイルを読み直す。
+ */
+export function specParagraph(ws: Workspace, section: string): string | null {
+  const m = /^(.*)#p(\d+)$/.exec(section);
+  if (!m) return null;
+  const abs = path.join(ws.repoRoot, m[1]);
+  if (!fs.existsSync(abs)) return null;
+  const want = Number(m[2]);
+  let n = 0;
+  for (const para of fs.readFileSync(abs, "utf8").split(/\n\s*\n/)) {
+    const trimmed = para.trim();
+    if (!trimmed) continue;
+    n++;
+    if (n === want) return trimmed;
+  }
+  return null;
+}
+
 export function tokenize(text: string): string[] {
   const out: string[] = [];
   for (const m of text.match(/[A-Za-z_][A-Za-z0-9_]{2,}|[ぁ-んァ-ヶ一-龠]{2,}/g) ?? []) {

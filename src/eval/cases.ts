@@ -4,6 +4,7 @@ import { openDbChecked } from "../store/projections.js";
 import { getObject } from "../store/objects.js";
 import type { Workspace } from "../store/paths.js";
 import { fileContent, manifestMap, resolveRevision } from "../ingest/revision.js";
+import { specParagraph } from "../spec/index.js";
 import { gitNoIndexHunks } from "../ingest/diff.js";
 import fs from "node:fs";
 import { isInformativeLine, multisetIntersect } from "../shared/lines.js";
@@ -58,6 +59,10 @@ const CLAIMS_RUBRIC = [
   "incorrect = 根拠が主張を支持していない(引用が無関係、結論が飛躍、値が明らかに誤り)。",
   "unsure = 根拠が不足していて妥当性を判断できない。",
   "値が『判定不能』のclaimは、そう判定したこと自体が妥当か(本当に判断材料がないか)を見てください。",
+  // REQ-602: 判定不能の妥当性は context で確認できる
+  "evidence.context に、その変更の捕捉状態・transcriptの可読性・仕様索引の有無が入っています。" +
+    "『判定不能』が妥当かはこれで確認してください(例: 捕捉されていないなら会話と照合できないのは事実)。",
+  "spec_excerpt は仕様書の実際の本文です。claimが指す要求と、変更内容が実際に対応しているかを見てください。",
 ];
 
 const OUTPUT_CONTRACT = {
@@ -138,6 +143,44 @@ function resolveHunk(ws: Workspace, h: HunkRow): { addedLines: string[]; removed
 /** hunkの実diffを復元(証拠として提示するため) */
 function hunkDiffText(ws: Workspace, h: HunkRow): string {
   return resolveHunk(ws, h).text;
+}
+
+const DIFF_MAX_LINES = 40;
+
+/** 新規ファイル追加などで数百行になると証拠が埋もれるため打ち切る(REQ-604) */
+function truncateDiff(text: string): string {
+  const lines = text.split("\n");
+  if (lines.length <= DIFF_MAX_LINES) return text;
+  return [...lines.slice(0, DIFF_MAX_LINES), `…(残り${lines.length - DIFF_MAX_LINES}行省略)`].join("\n");
+}
+
+/**
+ * claim判定の妥当性を確かめるための文脈(REQ-602)。
+ * 「判定不能」の理由が事実かどうか(本当に捕捉されていないのか、transcriptが読めないのか、
+ * 仕様索引が空なのか)を判定者が確認できるようにする。
+ */
+function claimContext(ws: Workspace, h: HunkRow & { hunk_ref: string }): Record<string, unknown> {
+  const db = openDbChecked(ws);
+  try {
+    const links = db
+      .prepare(
+        `SELECT e.operation_id, e.session_ref, e.transcript_line
+         FROM lineage_links l JOIN edit_events e ON e.operation_id=l.operation_id
+         WHERE l.hunk_instance_id=?`,
+      )
+      .all(h.hunk_ref) as { operation_id: string; session_ref: string; transcript_line: number | null }[];
+    const spec = db.prepare("SELECT COUNT(*) c, COUNT(req_id) r FROM spec_index").get() as { c: number; r: number };
+    return {
+      edit_capture_status: h.edit_capture_status,
+      lineage_status: h.lineage_status,
+      context_status: h.context_status,
+      attributed_event_count: links.length,
+      transcript_available: links.some((l) => l.session_ref && l.transcript_line !== null && fs.existsSync(l.session_ref)),
+      spec_index: { paragraphs: spec.c, with_req_id: spec.r },
+    };
+  } finally {
+    db.close();
+  }
 }
 
 const EVENT_DIFF_MAX_LINES = 20;
@@ -363,12 +406,19 @@ export function buildCasePack(ws: Workspace, kind: EvalKind, sample: number): Ev
             return { ...ev, quoted_text: q[0]?.text ?? "(引用元を復元できません)" };
           }
           if (ev.type === "spec") {
+            // REQ-601: spec_indexが持つのはトークン列なので、仕様ファイルから本文を読み直す
+            const body = specParagraph(ws, ev.section as string);
             const db2 = openDbChecked(ws);
             try {
               const row = db2
-                .prepare("SELECT heading, tokens FROM spec_index WHERE file=? AND section=? LIMIT 1")
-                .get(ev.file as string, ev.section as string) as { heading: string; tokens: string } | undefined;
-              return { ...ev, spec_excerpt: row ? `${row.heading}: ${row.tokens.slice(0, 200)}` : "(仕様節を復元できません)" };
+                .prepare("SELECT heading FROM spec_index WHERE file=? AND section=? LIMIT 1")
+                .get(ev.file as string, ev.section as string) as { heading: string } | undefined;
+              return {
+                ...ev,
+                spec_excerpt: body
+                  ? `${row?.heading ? row.heading + ": " : ""}${body.slice(0, 500)}`
+                  : "(仕様節を復元できません)",
+              };
             } finally {
               db2.close();
             }
@@ -387,8 +437,10 @@ export function buildCasePack(ws: Workspace, kind: EvalKind, sample: number): Ev
             tool_reason: c.reason,
           },
           evidence: {
-            hunk_diff: hunkDiffText(ws, c),
+            hunk_diff: truncateDiff(hunkDiffText(ws, c)),
             claim_evidence: materialized,
+            // REQ-602: 「判定不能」が妥当かを判定者が確かめられるようにする判断材料
+            context: claimContext(ws, c),
           },
           allowed_verdicts: ["correct", "incorrect", "unsure"],
         });
