@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
-import { AirevError } from "../shared/errors.js";
+import { ProvenError } from "../shared/errors.js";
 import { SCHEMA_VERSION, type EventEnvelope } from "../shared/types.js";
 import { readEvents } from "./events.js";
 import { deleteObject, getObject, hasObject, listObjects } from "./objects.js";
@@ -9,7 +9,7 @@ import { eventsDir, exportsDir, type Workspace } from "./paths.js";
 
 /** purge(F-11): スナップショット本体・派生キャッシュのみ削除。イベントは削除しない */
 export function runPurge(ws: Workspace, before: Date): { deleted: number; kept: number } {
-  if (Number.isNaN(before.getTime())) throw new AirevError("input", "purge --before の日付が不正です");
+  if (Number.isNaN(before.getTime())) throw new ProvenError("input", "purge --before の日付が不正です");
   // hash→最終参照時刻(edit events)
   const lastRef = new Map<string, number>();
   const edits = readEvents(ws, "edits");
@@ -188,7 +188,7 @@ export function runMigrate(ws: Workspace, def: MigrationDef): { migrated: number
     // 復元(元ファイル非破壊)
     fs.rmSync(dir, { recursive: true, force: true });
     fs.renameSync(backup, dir);
-    throw new AirevError("corrupt", `migrate失敗(元ファイルへ復元しました): ${String(e)}`);
+    throw new ProvenError("corrupt", `migrate失敗(元ファイルへ復元しました): ${String(e)}`);
   }
   fs.rmSync(backup, { recursive: true, force: true });
   return { migrated, noop: false };
@@ -207,7 +207,7 @@ export function evalCaptureState(ws: Workspace): { linked: number; uncaptured: n
     const latest = db.prepare("SELECT job_id FROM ingest_runs ORDER BY ts DESC, job_id DESC LIMIT 1").get() as
       | { job_id: string }
       | undefined;
-    if (!latest) throw new AirevError("empty", "ingestが未実行です");
+    if (!latest) throw new ProvenError("empty", "ingestが未実行です");
     const rows = db
       .prepare("SELECT edit_capture_status, lineage_status FROM hunks WHERE ingest_job_id=?")
       .all(latest.job_id) as { edit_capture_status: string | null; lineage_status: string | null }[];

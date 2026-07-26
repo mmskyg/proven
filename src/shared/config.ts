@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import YAML from "yaml";
 import { z } from "zod";
-import { AirevError } from "./errors.js";
+import { ProvenError } from "./errors.js";
 
 const ConfigSchema = z.object({
   version: z.number().default(1),
@@ -34,7 +34,7 @@ const ConfigSchema = z.object({
     .prefault({}),
   policy: z
     .object({
-      path: z.string().default(".airev/policy.yaml"),
+      path: z.string().default(".proven/policy.yaml"),
       precheck_on_stop: z.boolean().default(false),
     })
     .prefault({}),
@@ -49,28 +49,28 @@ const ConfigSchema = z.object({
   lineage: z.object({ time_budget_ms: z.number().default(60000) }).default({ time_budget_ms: 60000 }),
 });
 
-export type AirevConfig = z.infer<typeof ConfigSchema>;
+export type ProvenConfig = z.infer<typeof ConfigSchema>;
 
-export function defaultConfig(): AirevConfig {
+export function defaultConfig(): ProvenConfig {
   return ConfigSchema.parse({});
 }
 
-export function loadConfig(airevDir: string): AirevConfig {
-  const p = path.join(airevDir, "config.yaml");
+export function loadConfig(provenDir: string): ProvenConfig {
+  const p = path.join(provenDir, "config.yaml");
   if (!fs.existsSync(p)) return defaultConfig();
   let raw: unknown;
   try {
     raw = YAML.parse(fs.readFileSync(p, "utf8")) ?? {};
   } catch (e) {
-    throw new AirevError("input", `config.yamlのYAMLパースに失敗: ${String(e)}`);
+    throw new ProvenError("input", `config.yamlのYAMLパースに失敗: ${String(e)}`);
   }
   const r = ConfigSchema.safeParse(raw);
-  if (!r.success) throw new AirevError("input", `config.yamlが不正です: ${r.error.message}`);
+  if (!r.success) throw new ProvenError("input", `config.yamlが不正です: ${r.error.message}`);
   return r.data;
 }
 
-export function saveConfig(airevDir: string, cfg: AirevConfig): void {
-  fs.writeFileSync(path.join(airevDir, "config.yaml"), YAML.stringify(cfg), { mode: 0o600 });
+export function saveConfig(provenDir: string, cfg: ProvenConfig): void {
+  fs.writeFileSync(path.join(provenDir, "config.yaml"), YAML.stringify(cfg), { mode: 0o600 });
 }
 
 // glob → RegExp (** / * のみ対応の簡易実装。boundary_paths/exclude用)
@@ -91,7 +91,7 @@ export function globToRegExp(glob: string): RegExp {
 export function validateGlob(glob: string): void {
   // 全メタ文字をエスケープするためRegExpエラーにはならない。不正=空・制御文字含み
   if (glob.trim() === "" || /[\x00-\x1f]/.test(glob)) {
-    throw new AirevError("input", `不正なglobパターンです: ${JSON.stringify(glob)}`);
+    throw new ProvenError("input", `不正なglobパターンです: ${JSON.stringify(glob)}`);
   }
 }
 

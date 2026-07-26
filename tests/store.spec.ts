@@ -7,7 +7,7 @@ import { getObject, isStorable, putObject } from "../src/store/objects.js";
 import { applyEvent, openDb, rebuild } from "../src/store/projections.js";
 import { runMigrate, runPurge, pct } from "../src/store/maintenance.js";
 import { OVERSIZE_BYTES } from "../src/shared/types.js";
-import { cleanup, initAirev, makeRepo, type Fixture } from "./helpers.js";
+import { cleanup, initProven, makeRepo, type Fixture } from "./helpers.js";
 
 let fx: Fixture;
 afterEach(() => cleanup(fx));
@@ -15,7 +15,7 @@ afterEach(() => cleanup(fx));
 describe("objects (content-addressed)", () => {
   it("N-11: 同一内容は1オブジェクトのみ(重複排除)", () => {
     fx = makeRepo();
-    initAirev(fx);
+    initProven(fx);
     const a = putObject(fx.ws, Buffer.from("hello\n"));
     const b = putObject(fx.ws, Buffer.from("hello\n"));
     expect(a.hash).toBe(b.hash);
@@ -24,7 +24,7 @@ describe("objects (content-addressed)", () => {
 
   it("E-18/E-19: binary・5MB超は本文非保存(マーカーのみ)", () => {
     fx = makeRepo();
-    initAirev(fx);
+    initProven(fx);
     const bin = putObject(fx.ws, Buffer.from([0x00, 0x01, 0x02]));
     expect(bin.stored).toBe(false);
     const big = putObject(fx.ws, Buffer.alloc(OVERSIZE_BYTES + 1, 97));
@@ -38,7 +38,7 @@ describe("objects (content-addressed)", () => {
 describe("イベントストア", () => {
   it("append→read往復・ULID時系列順", () => {
     fx = makeRepo();
-    initAirev(fx);
+    initProven(fx);
     appendEvent(fx.ws, "analysis", "test_a", { n: 1 });
     appendEvent(fx.ws, "analysis", "test_b", { n: 2 });
     const r = readEvents(fx.ws, "analysis");
@@ -48,9 +48,9 @@ describe("イベントストア", () => {
 
   it("E-01: 破損行はskipしカウント、後続行は正常処理", () => {
     fx = makeRepo();
-    initAirev(fx);
+    initProven(fx);
     appendEvent(fx.ws, "analysis", "before", {});
-    fs.appendFileSync(path.join(fx.ws.airevDir, "events", "analysis.jsonl"), "{{{broken json\n");
+    fs.appendFileSync(path.join(fx.ws.provenDir, "events", "analysis.jsonl"), "{{{broken json\n");
     appendEvent(fx.ws, "analysis", "after", {});
     const r = readEvents(fx.ws, "analysis");
     expect(r.corruptLines).toBe(1);
@@ -59,11 +59,11 @@ describe("イベントストア", () => {
 
   it("N-39: decisionsは全行prev_record_hash連鎖(genesisから)", () => {
     fx = makeRepo();
-    initAirev(fx);
+    initProven(fx);
     appendEvent(fx.ws, "decisions", "origin_confirmed", { hunk_ref: "h1", attribute: "instructed", confirmed_value: "yes", actor_id: "t" });
     appendEvent(fx.ws, "decisions", "origin_confirmed", { hunk_ref: "h1", attribute: "necessity", confirmed_value: "essential", actor_id: "t" });
     const lines = fs
-      .readFileSync(path.join(fx.ws.airevDir, "events", "decisions.jsonl"), "utf8")
+      .readFileSync(path.join(fx.ws.provenDir, "events", "decisions.jsonl"), "utf8")
       .split("\n")
       .filter(Boolean)
       .map((l) => JSON.parse(l));
@@ -75,11 +75,11 @@ describe("イベントストア", () => {
 
   it("E-47: 後続行が存在する行の改変を検出(位置を提示)", () => {
     fx = makeRepo();
-    initAirev(fx);
+    initProven(fx);
     for (let i = 0; i < 3; i++) {
       appendEvent(fx.ws, "decisions", "origin_confirmed", { hunk_ref: `h${i}`, attribute: "instructed", confirmed_value: "yes", actor_id: "t" });
     }
-    const p = path.join(fx.ws.airevDir, "events", "decisions.jsonl");
+    const p = path.join(fx.ws.provenDir, "events", "decisions.jsonl");
     const lines = fs.readFileSync(p, "utf8").split("\n").filter(Boolean);
     const tampered = JSON.parse(lines[0]);
     tampered.payload.confirmed_value = "no"; // 改ざん
@@ -93,15 +93,15 @@ describe("イベントストア", () => {
 
   it("N-44/U-08: rotate世代切替+世代跨ぎ検証+跨ぎ改変検出", () => {
     fx = makeRepo();
-    initAirev(fx);
+    initProven(fx);
     appendEvent(fx.ws, "decisions", "origin_confirmed", { hunk_ref: "h1", attribute: "instructed", confirmed_value: "yes", actor_id: "t" });
     const r = rotate(fx.ws, "decisions");
     expect(r.generation).toBe(1);
-    expect(fs.existsSync(path.join(fx.ws.airevDir, "events", "archive", r.archived))).toBe(true);
+    expect(fs.existsSync(path.join(fx.ws.provenDir, "events", "archive", r.archived))).toBe(true);
     appendEvent(fx.ws, "decisions", "origin_confirmed", { hunk_ref: "h2", attribute: "necessity", confirmed_value: "essential", actor_id: "t" });
     expect(verifyDecisionsChain(fx.ws).ok).toBe(true);
     // 世代跨ぎで保護される行(generation_started=後続行あり)を改変
-    const p = path.join(fx.ws.airevDir, "events", "decisions.jsonl");
+    const p = path.join(fx.ws.provenDir, "events", "decisions.jsonl");
     const lines = fs.readFileSync(p, "utf8").split("\n").filter(Boolean);
     const gen = JSON.parse(lines[0]);
     expect(gen.type).toBe("generation_started");
@@ -117,7 +117,7 @@ describe("イベントストア", () => {
 
   it("E-14: 孤児postはprojection行を作らず警告カウント", () => {
     fx = makeRepo();
-    initAirev(fx);
+    initProven(fx);
     appendEvent(fx.ws, "edits", "edit_post", { operation_id: "no_pre", result_blob_hash: null, tool_status: "success" });
     const r = rebuild(fx.ws);
     expect(r.orphanPosts).toBe(1);
@@ -128,12 +128,12 @@ describe("イベントストア", () => {
 
   it("E-48: migration機構(rename適用・冪等・失敗時非破壊)", () => {
     fx = makeRepo();
-    initAirev(fx);
+    initProven(fx);
     appendEvent(fx.ws, "analysis", "test_ev", { old_name: 1 });
-    const before = fs.readFileSync(path.join(fx.ws.airevDir, "events", "analysis.jsonl"), "utf8");
+    const before = fs.readFileSync(path.join(fx.ws.provenDir, "events", "analysis.jsonl"), "utf8");
     // 失敗注入 → 非破壊
     expect(() => runMigrate(fx.ws, { from: 1, to: 2, rename_fields: { test_ev: { old_name: "new_name" } }, fail: true })).toThrow();
-    expect(fs.readFileSync(path.join(fx.ws.airevDir, "events", "analysis.jsonl"), "utf8")).toBe(before);
+    expect(fs.readFileSync(path.join(fx.ws.provenDir, "events", "analysis.jsonl"), "utf8")).toBe(before);
     // 正常適用
     const r1 = runMigrate(fx.ws, { from: 1, to: 2, rename_fields: { test_ev: { old_name: "new_name" } } });
     expect(r1.noop).toBe(false);
@@ -148,7 +148,7 @@ describe("イベントストア", () => {
 
   it("N-43: purgeはスナップショットのみ削除しイベントは無傷", () => {
     fx = makeRepo();
-    initAirev(fx);
+    initProven(fx);
     const { hash } = putObject(fx.ws, Buffer.from("old content\n"));
     // 古いイベントとして参照を記録
     const env = appendEvent(fx.ws, "edits", "edit_pre", {
@@ -161,7 +161,7 @@ describe("イベントストア", () => {
       conversation_ref: null,
     });
     // イベントtsを過去に偽装(purge判定はイベントts基準)
-    const p = path.join(fx.ws.airevDir, "events", "edits.jsonl");
+    const p = path.join(fx.ws.provenDir, "events", "edits.jsonl");
     const line = JSON.parse(fs.readFileSync(p, "utf8").trim());
     line.ts = "2000-01-01T00:00:00.000Z";
     fs.writeFileSync(p, JSON.stringify(line) + "\n");

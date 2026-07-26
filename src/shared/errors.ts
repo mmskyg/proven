@@ -9,7 +9,7 @@ const EXIT_CODES: Record<ErrorCategory, number> = {
   gate: 10, // 検証ゲート該当
 };
 
-export class AirevError extends Error {
+export class ProvenError extends Error {
   category: ErrorCategory;
   constructor(category: ErrorCategory, message: string) {
     super(message);

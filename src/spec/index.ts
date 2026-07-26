@@ -9,7 +9,7 @@ const REQ_RE = /REQ-\d+/g;
 
 function walkFiles(root: string, out: string[] = []): string[] {
   for (const entry of fs.readdirSync(root, { withFileTypes: true })) {
-    if (entry.name === ".git" || entry.name === ".airev" || entry.name === "node_modules") continue;
+    if (entry.name === ".git" || entry.name === ".proven" || entry.name === "node_modules") continue;
     const p = path.join(root, entry.name);
     if (entry.isDirectory()) walkFiles(p, out);
     else out.push(p);
@@ -18,7 +18,7 @@ function walkFiles(root: string, out: string[] = []): string[] {
 }
 
 export function specFiles(ws: Workspace): string[] {
-  const cfg = loadConfig(ws.airevDir);
+  const cfg = loadConfig(ws.provenDir);
   const regs = cfg.spec_sources.map((s) => globToRegExp(s.glob));
   return walkFiles(ws.repoRoot)
     .map((p) => path.relative(ws.repoRoot, p))

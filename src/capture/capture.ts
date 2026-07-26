@@ -58,7 +58,7 @@ export function resolveCapturePath(
   const realRoot = fs.realpathSync(ws.repoRoot);
   if (!(abs === realRoot || abs.startsWith(realRoot + path.sep))) return null; // リポジトリ外
   const rel = path.relative(realRoot, abs);
-  if (rel.startsWith(".airev/") || rel === ".airev") return null; // 自己データ除外
+  if (rel.startsWith(".proven/") || rel === ".proven") return null; // 自己データ除外
   if (matchAnyGlob(rel, captureExclude)) return null;
   return { abs, rel };
 }
@@ -86,7 +86,7 @@ export function runCapture(ws: Workspace, phase: "pre" | "post", input: HookInpu
   try {
     const toolName = input.tool_name ?? "";
     if (!TARGET_TOOLS.has(toolName)) return { recorded: false, reason: "non-target-tool" };
-    const cfg = loadConfig(ws.airevDir);
+    const cfg = loadConfig(ws.provenDir);
     const rawPath = (input.tool_input?.file_path ?? input.tool_input?.notebook_path) as string | undefined;
     if (!rawPath) return { recorded: false, reason: "no-file-path" };
     const resolved = resolveCapturePath(ws, rawPath, cfg.capture.exclude);

@@ -18,7 +18,7 @@ export function sh(cwd: string, cmd: string, args: string[]): string {
 
 /** 決定的なfixtureリポジトリ生成 */
 export function makeRepo(files: Record<string, string> = {}): Fixture {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "airev-test-"));
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "proven-test-"));
   sh(dir, "git", ["init", "-q"]);
   sh(dir, "git", ["config", "user.email", "test@example.com"]);
   sh(dir, "git", ["config", "user.name", "test"]);
@@ -29,15 +29,15 @@ export function makeRepo(files: Record<string, string> = {}): Fixture {
   }
   sh(dir, "git", ["add", "-A"]);
   sh(dir, "git", ["commit", "-qm", "init", "--allow-empty"]);
-  const transcriptDir = fs.mkdtempSync(path.join(os.tmpdir(), "airev-tr-"));
+  const transcriptDir = fs.mkdtempSync(path.join(os.tmpdir(), "proven-tr-"));
   return { dir, ws: workspace(dir), transcriptDir };
 }
 
-export function initAirev(fx: Fixture): void {
+export function initProven(fx: Fixture): void {
   runInit(fx.ws, { yes: true, isTTY: false });
   // initによる.gitignore/.claude変更をbaseへ含める(テストの関心を編集に絞る)
   sh(fx.dir, "git", ["add", "-A"]);
-  sh(fx.dir, "git", ["commit", "-qm", "airev-init", "--allow-empty"]);
+  sh(fx.dir, "git", ["commit", "-qm", "proven-init", "--allow-empty"]);
 }
 
 export function writeTranscript(fx: Fixture, name: string, messages: { role: "user" | "assistant"; text: string }[]): string {

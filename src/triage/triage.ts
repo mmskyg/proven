@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { loadConfig, matchAnyGlob } from "../shared/config.js";
-import { AirevError } from "../shared/errors.js";
+import { ProvenError } from "../shared/errors.js";
 import { INDETERMINATE } from "../shared/types.js";
 import { openDbChecked } from "../store/projections.js";
 import type { Workspace } from "../store/paths.js";
@@ -36,13 +36,13 @@ export interface TriageResult {
 
 /** 加点表(機能設計書F-03)。内訳は常に保持 */
 export function runTriage(ws: Workspace): TriageResult {
-  const cfg = loadConfig(ws.airevDir);
+  const cfg = loadConfig(ws.provenDir);
   // 不正glob検出(E-35)
   for (const g of cfg.triage.boundary_paths) {
     try {
       matchAnyGlob("x", [g]);
     } catch {
-      throw new AirevError("input", `triage.boundary_paths に不正なglobがあります: ${g}`);
+      throw new ProvenError("input", `triage.boundary_paths に不正なglobがあります: ${g}`);
     }
   }
   const db = openDbChecked(ws);
@@ -50,7 +50,7 @@ export function runTriage(ws: Workspace): TriageResult {
     const latest = db
       .prepare("SELECT job_id FROM ingest_runs ORDER BY ts DESC, job_id DESC LIMIT 1")
       .get() as { job_id: string } | undefined;
-    if (!latest) throw new AirevError("empty", "ingestが未実行です。`airev ingest` を実行してください");
+    if (!latest) throw new ProvenError("empty", "ingestが未実行です。`proven ingest` を実行してください");
     const hunks = db
       .prepare(
         `SELECT hunk_instance_id, file, new_start, new_lines, edit_capture_status, lineage_status, oversize
@@ -65,7 +65,7 @@ export function runTriage(ws: Workspace): TriageResult {
       lineage_status: string | null;
       oversize: number;
     }[];
-    if (hunks.length === 0) throw new AirevError("empty", "最新ingestに対象hunkがありません");
+    if (hunks.length === 0) throw new ProvenError("empty", "最新ingestに対象hunkがありません");
 
     const claimStmt = db.prepare("SELECT kind, value, reason FROM claims WHERE hunk_ref=?");
     const ocStmt = db.prepare("SELECT attribute, confirmed_value FROM origin_confirmed WHERE hunk_ref=?");
@@ -171,7 +171,7 @@ export function renderTriageText(r: TriageResult): string {
 
 export function renderTriageMd(r: TriageResult): string {
   const L: string[] = [];
-  L.push("# airev triageレポート", "");
+  L.push("# proven triageレポート", "");
   L.push(`- 対象hunk: ${r.counts.total} / 精読 ${r.counts.focus} / 軽確認 ${r.counts.light}`);
   L.push(
     `- 来歴内訳: uncaptured ${r.counts.uncaptured} / broken ${r.counts.broken} / unsolicited候補 ${r.counts.unsolicited}`,

@@ -2,14 +2,14 @@
 import fs from "node:fs";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { AirevError } from "../src/shared/errors.js";
+import { ProvenError } from "../src/shared/errors.js";
 import { HEURISTIC_CONF_MAX, INDETERMINATE } from "../src/shared/types.js";
 import { readEvents } from "../src/store/events.js";
 import { getObject } from "../src/store/objects.js";
 import { applyEvent, openDb, derivePendingStatuses } from "../src/store/projections.js";
 import { runIngest } from "../src/ingest/ingest.js";
 import { buildWorktreeRevision } from "../src/ingest/revision.js";
-import { capturedEdit, cleanup, initAirev, makeRepo, manualEdit, writeTranscript, sh, type Fixture } from "./helpers.js";
+import { capturedEdit, cleanup, initProven, makeRepo, manualEdit, writeTranscript, sh, type Fixture } from "./helpers.js";
 import YAML from "yaml";
 
 let fx: Fixture;
@@ -20,7 +20,7 @@ const BASE_APP = "line1\nline2\nline3\n";
 describe("capture(N-06〜N-12)", () => {
   it("N-06/N-07: Pre/Post対がoperation_idで結合、上書き前内容が復元可能", () => {
     fx = makeRepo({ "src/app.ts": BASE_APP });
-    initAirev(fx);
+    initProven(fx);
     const op = capturedEdit(fx, "src/app.ts", "line1\nEDITED\nline3\n");
     const events = readEvents(fx.ws, "edits").events;
     expect(events.map((e) => e.type)).toEqual(["edit_pre", "edit_post"]);
@@ -34,7 +34,7 @@ describe("capture(N-06〜N-12)", () => {
 
   it("N-08: 新規ファイル(Write)はpre_blob_hash=nullで捕捉される", () => {
     fx = makeRepo();
-    initAirev(fx);
+    initProven(fx);
     capturedEdit(fx, "src/new.ts", "brand new\n", { tool: "Write" });
     const pre = readEvents(fx.ws, "edits").events[0].payload as { pre_blob_hash: string | null; file: string };
     expect(pre.pre_blob_hash).toBeNull();
@@ -43,7 +43,7 @@ describe("capture(N-06〜N-12)", () => {
 
   it("N-10: conversation_refがtranscript末尾行番号を指す", () => {
     fx = makeRepo({ "src/app.ts": BASE_APP });
-    initAirev(fx);
+    initProven(fx);
     const tr = writeTranscript(fx, "s1", [
       { role: "user", text: "hello" },
       { role: "assistant", text: "hi" },
@@ -55,8 +55,8 @@ describe("capture(N-06〜N-12)", () => {
 
   it("E-12: capture.exclude一致はイベント・スナップショットとも記録なし", () => {
     fx = makeRepo({ "secrets/key.txt": "SECRET\n" });
-    initAirev(fx);
-    const cfgPath = path.join(fx.ws.airevDir, "config.yaml");
+    initProven(fx);
+    const cfgPath = path.join(fx.ws.provenDir, "config.yaml");
     const cfg = YAML.parse(fs.readFileSync(cfgPath, "utf8"));
     cfg.capture = { exclude: ["secrets/**"] };
     fs.writeFileSync(cfgPath, YAML.stringify(cfg));
@@ -67,7 +67,7 @@ describe("capture(N-06〜N-12)", () => {
 
   it("E-13: tool_use_id欠落は合成キーでPre/Postが対応", () => {
     fx = makeRepo({ "src/app.ts": BASE_APP });
-    initAirev(fx);
+    initProven(fx);
     capturedEdit(fx, "src/app.ts", "changed\n", { toolUseId: "" });
     const events = readEvents(fx.ws, "edits").events;
     const pre = events[0].payload as { operation_id: string };
@@ -78,7 +78,7 @@ describe("capture(N-06〜N-12)", () => {
 
   it("E-15/E-16: post無しpre→transcript終了でaborted/継続中(24h未満)はpending", () => {
     fx = makeRepo({ "a.ts": "x\n", "b.ts": "y\n" });
-    initAirev(fx);
+    initProven(fx);
     const tr = writeTranscript(fx, "alive", [{ role: "user", text: "hi" }]);
     capturedEdit(fx, "a.ts", "x2\n", { skipPost: true, transcript: tr }); // 継続中
     capturedEdit(fx, "b.ts", "y2\n", { skipPost: true, transcript: path.join(fx.transcriptDir, "gone.jsonl") }); // 終了(不存在)
@@ -102,7 +102,7 @@ describe("capture(N-06〜N-12)", () => {
 
   it("E-17: tool失敗(failure)はcompletedにならない", () => {
     fx = makeRepo({ "a.ts": "x\n" });
-    initAirev(fx);
+    initProven(fx);
     capturedEdit(fx, "a.ts", "x2\n", { failPost: true });
     const db = openDb(fx.ws);
     for (const env of readEvents(fx.ws, "edits").events) applyEvent(db, env);
@@ -114,7 +114,7 @@ describe("capture(N-06〜N-12)", () => {
 describe("ingest統合(N-14〜N-25 / E-20〜E-29)", () => {
   it("N-14/N-23: captured編集→linked、2回目ingestは新規変更のみ", () => {
     fx = makeRepo({ "src/app.ts": BASE_APP });
-    initAirev(fx);
+    initProven(fx);
     const tr = writeTranscript(fx, "s1", [{ role: "user", text: "src/app.ts line2を直して" }]);
     capturedEdit(fx, "src/app.ts", "line1\nFIXED\nline3\n", { transcript: tr });
     const r1 = runIngest(fx.ws);
@@ -129,7 +129,7 @@ describe("ingest統合(N-14〜N-25 / E-20〜E-29)", () => {
 
   it("N-19/N-20: 手編集はuncaptured、混在はhunk単位分離", () => {
     fx = makeRepo({ "src/app.ts": "l1\nl2\nl3\nl4\nl5\n" });
-    initAirev(fx);
+    initProven(fx);
     capturedEdit(fx, "src/app.ts", "l1\nCAPTURED\nl3\nl4\nl5\n");
     manualEdit(fx, "src/app.ts", "l1\nCAPTURED\nl3\nl4\nMANUAL\nl5\n");
     const r = runIngest(fx.ws);
@@ -140,7 +140,7 @@ describe("ingest統合(N-14〜N-25 / E-20〜E-29)", () => {
 
   it("N-21: formatter介在→broken+nolineage_cause=formatter claim", () => {
     fx = makeRepo({ "src/app.ts": "l1\nl2\nl3\n" });
-    initAirev(fx);
+    initProven(fx);
     capturedEdit(fx, "src/app.ts", "l1\nEDITED\nl3\n");
     manualEdit(fx, "src/app.ts", "  l1\n  EDITED\n  l3\n"); // formatter相当
     const r = runIngest(fx.ws);
@@ -156,7 +156,7 @@ describe("ingest統合(N-14〜N-25 / E-20〜E-29)", () => {
 
   it("N-22: worktree revision_refの決定性", () => {
     fx = makeRepo({ "a.ts": "x\n" });
-    initAirev(fx);
+    initProven(fx);
     const r1 = buildWorktreeRevision(fx.ws).rev.ref;
     const r2 = buildWorktreeRevision(fx.ws).rev.ref;
     expect(r1).toBe(r2);
@@ -166,7 +166,7 @@ describe("ingest統合(N-14〜N-25 / E-20〜E-29)", () => {
 
   it("N-24: --range同一入力の再実行はno-op(イベント重複ゼロ)", () => {
     fx = makeRepo({ "a.ts": "v1\n" });
-    initAirev(fx);
+    initProven(fx);
     manualEdit(fx, "a.ts", "v2\n");
     sh(fx.dir, "git", ["add", "-A"]);
     sh(fx.dir, "git", ["commit", "-qm", "v2"]);
@@ -181,7 +181,7 @@ describe("ingest統合(N-14〜N-25 / E-20〜E-29)", () => {
 
   it("N-25: rebase相当の軽微変更でhunk_lineage_linked(Jaccard≥0.6)", () => {
     fx = makeRepo({ "a.ts": "base\n" });
-    initAirev(fx);
+    initProven(fx);
     manualEdit(fx, "a.ts", "base\nconst value = compute(x)\n");
     sh(fx.dir, "git", ["add", "-A"]);
     sh(fx.dir, "git", ["commit", "-qm", "c1"]);
@@ -199,39 +199,39 @@ describe("ingest統合(N-14〜N-25 / E-20〜E-29)", () => {
 
   it("E-20: イベントゼロ→全hunk uncapturedで正常完了", () => {
     fx = makeRepo({ "a.ts": "x\n" });
-    initAirev(fx);
+    initProven(fx);
     manualEdit(fx, "a.ts", "y\n");
     const r = runIngest(fx.ws);
     expect(r.uncaptured).toBe(r.hunks);
   });
 
-  it("E-21: 差分なしはexit相当のempty(AirevError category=empty)", () => {
+  it("E-21: 差分なしはexit相当のempty(ProvenError category=empty)", () => {
     fx = makeRepo({ "a.ts": "x\n" });
-    initAirev(fx);
+    initProven(fx);
     try {
       runIngest(fx.ws);
       expect.unreachable("should throw");
     } catch (e) {
-      expect(e).toBeInstanceOf(AirevError);
-      expect((e as AirevError).category).toBe("empty");
-      expect((e as AirevError).exitCode).toBe(1);
+      expect(e).toBeInstanceOf(ProvenError);
+      expect((e as ProvenError).category).toBe("empty");
+      expect((e as ProvenError).exitCode).toBe(1);
     }
   });
 
   it("E-22: 不正--rangeはinput(exit 2)", () => {
     fx = makeRepo({ "a.ts": "x\n" });
-    initAirev(fx);
+    initProven(fx);
     try {
       runIngest(fx.ws, { range: "nonexistent..HEAD" });
       expect.unreachable();
     } catch (e) {
-      expect((e as AirevError).category).toBe("input");
+      expect((e as ProvenError).category).toBe("input");
     }
   });
 
   it("E-18/E-19相当: バイナリファイルはレビュー対象外一覧へ", () => {
     fx = makeRepo({ "a.ts": "x\n" });
-    initAirev(fx);
+    initProven(fx);
     fs.writeFileSync(path.join(fx.dir, "bin.dat"), Buffer.from([0, 1, 2, 3]));
     manualEdit(fx, "a.ts", "y\n");
     const r = runIngest(fx.ws);
@@ -240,8 +240,8 @@ describe("ingest統合(N-14〜N-25 / E-20〜E-29)", () => {
 
   it("E-29: capture.exclude対象はworktree集合から除外+警告", () => {
     fx = makeRepo({ "a.ts": "x\n", "secrets/s.txt": "sec\n" });
-    initAirev(fx);
-    const cfgPath = path.join(fx.ws.airevDir, "config.yaml");
+    initProven(fx);
+    const cfgPath = path.join(fx.ws.provenDir, "config.yaml");
     const cfg = YAML.parse(fs.readFileSync(cfgPath, "utf8"));
     cfg.capture = { exclude: ["secrets/**"] };
     fs.writeFileSync(cfgPath, YAML.stringify(cfg));
@@ -262,7 +262,7 @@ describe("claims(N-26〜N-30 / E-30〜E-32)", () => {
       "src/app.ts": BASE_APP,
       ...(specText !== null ? { "docs/spec.md": specText } : {}),
     });
-    initAirev(fx);
+    initProven(fx);
     const tr = utterance !== null ? writeTranscript(fx, "s1", [{ role: "user", text: utterance }]) : "";
     capturedEdit(fx, "src/app.ts", newContent, { transcript: tr });
     runIngest(fx.ws);
@@ -301,7 +301,7 @@ describe("claims(N-26〜N-30 / E-30〜E-32)", () => {
 
   it("N-29: import入替のみ→incidental", () => {
     fx = makeRepo({ "src/app.ts": 'import a from "a"\nimport b from "b"\nbody()\n' });
-    initAirev(fx);
+    initProven(fx);
     capturedEdit(fx, "src/app.ts", 'import b from "b"\nimport a from "a"\nbody()\n');
     runIngest(fx.ws);
     const db = openDb(fx.ws);
@@ -328,7 +328,7 @@ describe("claims(N-26〜N-30 / E-30〜E-32)", () => {
 
   it("E-31: transcript削除済み→instructed判定不能(uncapturedにしない)", () => {
     fx = makeRepo({ "src/app.ts": BASE_APP });
-    initAirev(fx);
+    initProven(fx);
     const tr = writeTranscript(fx, "gone", [{ role: "user", text: "編集して" }]);
     capturedEdit(fx, "src/app.ts", "line1\nX\nline3\n", { transcript: tr });
     fs.rmSync(tr); // transcript消失
@@ -358,7 +358,7 @@ describe("claims(N-26〜N-30 / E-30〜E-32)", () => {
 describe("日本語トークン化(ドッグフーディングで発見した誤判定の回帰テスト)", () => {
   it("日本語の指示と日本語コンテンツでinstructed=ありになる", () => {
     fx = makeRepo({ "README.md": "# タイトル\n\n本文\n" });
-    initAirev(fx);
+    initProven(fx);
     const tr = writeTranscript(fx, "s1", [
       { role: "user", text: "制限事項として未検証のところを明示的にREADMEに書いてください" },
     ]);
@@ -376,7 +376,7 @@ describe("日本語トークン化(ドッグフーディングで発見した誤
 
   it("無関係な日本語発話では「なし」のまま(過剰一致していない)", () => {
     fx = makeRepo({ "src/app.ts": "l1\nl2\n" });
-    initAirev(fx);
+    initProven(fx);
     const tr = writeTranscript(fx, "s1", [{ role: "user", text: "今日の天気はどうですか" }]);
     capturedEdit(fx, "src/app.ts", "l1\nl2\nconst cacheLayer = init()\n", { transcript: tr });
     runIngest(fx.ws);

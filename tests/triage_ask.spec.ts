@@ -3,19 +3,19 @@ import fs from "node:fs";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import YAML from "yaml";
-import { AirevError } from "../src/shared/errors.js";
+import { ProvenError } from "../src/shared/errors.js";
 import { openDb } from "../src/store/projections.js";
 import { runIngest } from "../src/ingest/ingest.js";
 import { renderTriageMd, renderTriageText, runTriage } from "../src/triage/triage.js";
 import { confirmOrigin, recordFinding, renderAsk, runAsk } from "../src/ask/ask.js";
 import { verifyDecisionsChain } from "../src/store/events.js";
-import { capturedEdit, cleanup, initAirev, makeRepo, manualEdit, writeTranscript, type Fixture } from "./helpers.js";
+import { capturedEdit, cleanup, initProven, makeRepo, manualEdit, writeTranscript, type Fixture } from "./helpers.js";
 
 let fx: Fixture;
 afterEach(() => cleanup(fx));
 
 function setConfig(mutate: (cfg: Record<string, any>) => void): void {
-  const p = path.join(fx.ws.airevDir, "config.yaml");
+  const p = path.join(fx.ws.provenDir, "config.yaml");
   const cfg = YAML.parse(fs.readFileSync(p, "utf8"));
   mutate(cfg);
   fs.writeFileSync(p, YAML.stringify(cfg));
@@ -27,7 +27,7 @@ function standardScenario(): void {
     "src/util.ts": 'import a from "a"\nimport b from "b"\nbody()\n',
     "docs/spec.md": "# 仕様\n\nREQ-001 認証はauthGuardを使う。",
   });
-  initAirev(fx);
+  initProven(fx);
   setConfig((c) => (c.triage = { boundary_paths: ["src/auth/**"] }));
   const tr = writeTranscript(fx, "s1", [{ role: "user", text: "無関係の雑談" }]);
   capturedEdit(fx, "src/auth/session.ts", "a1\nsneakyPersist()\na3\n", { transcript: tr }); // unsolicited候補+境界
@@ -63,7 +63,7 @@ describe("triage(N-31〜N-36)", () => {
     standardScenario();
     const r = runTriage(fx.ws);
     const md = renderTriageMd(r);
-    expect(md).toContain("# airev triageレポート");
+    expect(md).toContain("# proven triageレポート");
     expect(md).toContain("## 精読リスト");
     expect(md).toContain("## unsolicited一覧");
     expect(md).toContain("uncaptured");
@@ -71,18 +71,18 @@ describe("triage(N-31〜N-36)", () => {
 
   it("E-34: ingest未実行はempty(exit 1相当)", () => {
     fx = makeRepo({ "a.ts": "x\n" });
-    initAirev(fx);
+    initProven(fx);
     try {
       runTriage(fx.ws);
       expect.unreachable();
     } catch (e) {
-      expect((e as AirevError).category).toBe("empty");
+      expect((e as ProvenError).category).toBe("empty");
     }
   });
 
   it("E-35: 不正glob(boundary_paths)はinput(exit 2相当)", () => {
     fx = makeRepo({ "a.ts": "x\n" });
-    initAirev(fx);
+    initProven(fx);
     manualEdit(fx, "a.ts", "y\n");
     runIngest(fx.ws);
     setConfig((c) => (c.triage = { boundary_paths: [""] })); // 空glob=不正
@@ -90,7 +90,7 @@ describe("triage(N-31〜N-36)", () => {
       runTriage(fx.ws);
       expect.unreachable();
     } catch (e) {
-      expect((e as AirevError).category).toBe("input");
+      expect((e as ProvenError).category).toBe("input");
     }
   });
 });
@@ -98,7 +98,7 @@ describe("triage(N-31〜N-36)", () => {
 describe("ask(N-37〜N-41 / E-36〜E-38)", () => {
   it("N-37/N-41: 4区分構造・LLM OFFでは推測セクションなし・AI説明は引用+注記", () => {
     fx = makeRepo({ "src/app.ts": "l1\nl2\nl3\n", "docs/spec.md": "# s\n\nREQ-001 sessionStoreを使う。" });
-    initAirev(fx);
+    initProven(fx);
     const tr = writeTranscript(fx, "s1", [
       { role: "user", text: "src/app.ts をsessionStore対応にして" },
       { role: "assistant", text: "sessionStoreを使うよう変更します" },
@@ -120,7 +120,7 @@ describe("ask(N-37〜N-41 / E-36〜E-38)", () => {
 
   it("N-38: file:line指定で最新ingestのhunkに解決", () => {
     fx = makeRepo({ "src/app.ts": "l1\nl2\nl3\n" });
-    initAirev(fx);
+    initProven(fx);
     capturedEdit(fx, "src/app.ts", "l1\nCHANGED\nl3\n");
     runIngest(fx.ws);
     const a = runAsk(fx.ws, "src/app.ts:2", "");
@@ -129,7 +129,7 @@ describe("ask(N-37〜N-41 / E-36〜E-38)", () => {
 
   it("N-39: confirmで属性単位のorigin_confirmed+チェーン正常+人間確定値が優先表示", () => {
     fx = makeRepo({ "src/app.ts": "l1\nl2\nl3\n" });
-    initAirev(fx);
+    initProven(fx);
     capturedEdit(fx, "src/app.ts", "l1\nX\nl3\n");
     runIngest(fx.ws);
     const db1 = openDb(fx.ws);
@@ -144,13 +144,13 @@ describe("ask(N-37〜N-41 / E-36〜E-38)", () => {
       confirmOrigin(fx.ws, hunkId, "instructed", "maybe", "a");
       expect.unreachable();
     } catch (e) {
-      expect((e as AirevError).category).toBe("input");
+      expect((e as ProvenError).category).toBe("input");
     }
   });
 
   it("N-40: finding記録(unverified/open)", () => {
     fx = makeRepo({ "src/app.ts": "l1\nl2\nl3\n" });
-    initAirev(fx);
+    initProven(fx);
     capturedEdit(fx, "src/app.ts", "l1\nX\nl3\n");
     runIngest(fx.ws);
     const db1 = openDb(fx.ws);
@@ -170,14 +170,14 @@ describe("ask(N-37〜N-41 / E-36〜E-38)", () => {
 
   it("E-36/E-38: 存在しないhunk=empty / uncaptured hunkは経緯なし明示", () => {
     fx = makeRepo({ "a.ts": "x\n" });
-    initAirev(fx);
+    initProven(fx);
     manualEdit(fx, "a.ts", "y\n");
     runIngest(fx.ws);
     try {
       runAsk(fx.ws, "deadbeef", "");
       expect.unreachable();
     } catch (e) {
-      expect((e as AirevError).category).toBe("empty");
+      expect((e as ProvenError).category).toBe("empty");
     }
     const a = runAsk(fx.ws, "a.ts:1", "");
     expect(a.noLineage).toBe(true);

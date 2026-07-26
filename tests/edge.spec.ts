@@ -11,15 +11,15 @@ import { exportProvenance, runPurge } from "../src/store/maintenance.js";
 import { runIngest } from "../src/ingest/ingest.js";
 import { runTriage } from "../src/triage/triage.js";
 import { runCapture } from "../src/capture/capture.js";
-import { capturedEdit, cleanup, cli, initAirev, makeRepo, manualEdit, readFileIn, type Fixture } from "./helpers.js";
+import { capturedEdit, cleanup, cli, initProven, makeRepo, manualEdit, readFileIn, type Fixture } from "./helpers.js";
 
 let fx: Fixture;
 afterEach(() => cleanup(fx));
 
 it("E-11: symlinkの実体がリポジトリ外なら捕捉対象外", () => {
   fx = makeRepo({ "a.ts": "x\n" });
-  initAirev(fx);
-  const outside = fs.mkdtempSync(path.join(os.tmpdir(), "airev-out-"));
+  initProven(fx);
+  const outside = fs.mkdtempSync(path.join(os.tmpdir(), "proven-out-"));
   try {
     fs.writeFileSync(path.join(outside, "real.txt"), "outside\n");
     fs.symlinkSync(path.join(outside, "real.txt"), path.join(fx.dir, "link.txt"));
@@ -40,11 +40,11 @@ it("E-11: symlinkの実体がリポジトリ外なら捕捉対象外", () => {
 
 it("E-23a: gitバイナリ不在はexit 3", () => {
   fx = makeRepo({ "a.ts": "x\n" });
-  initAirev(fx);
+  initProven(fx);
   const tsx = path.join(process.cwd(), "node_modules", ".bin", "tsx");
   const main = path.join(process.cwd(), "src", "cli", "main.ts");
   // nodeは必要なのでnodeのみのPATHを合成
-  const bindir = fs.mkdtempSync(path.join(os.tmpdir(), "airev-bin-"));
+  const bindir = fs.mkdtempSync(path.join(os.tmpdir(), "proven-bin-"));
   try {
     fs.symlinkSync(process.execPath, path.join(bindir, "node"));
     const r = spawnSync(tsx, [main, "ingest"], { cwd: fx.dir, encoding: "utf8", env: { ...process.env, PATH: bindir }, timeout: 60000 });
@@ -56,7 +56,7 @@ it("E-23a: gitバイナリ不在はexit 3", () => {
 
 it("E-28: 300行超hunkはoversizeフラグ+triage警告(分割しない=Phase 1)", () => {
   fx = makeRepo({ "big.ts": "base\n" });
-  initAirev(fx);
+  initProven(fx);
   const big = "base\n" + Array.from({ length: OVERSIZE_HUNK_LINES + 10 }, (_, i) => `added-${i}`).join("\n") + "\n";
   manualEdit(fx, "big.ts", big);
   const r = runIngest(fx.ws);
@@ -71,11 +71,11 @@ it("E-28: 300行超hunkはoversizeフラグ+triage警告(分割しない=Phase 1
 
 it("E-26/S-09c: purge済みスナップショット参照はpurged=true表示、lineageはイベントから再構築可", () => {
   fx = makeRepo({ "a.ts": "v1\n" });
-  initAirev(fx);
+  initProven(fx);
   capturedEdit(fx, "a.ts", "v2\n");
   runIngest(fx.ws);
   // イベントtsを過去に偽装してpurge対象化
-  const p = path.join(fx.ws.airevDir, "events", "edits.jsonl");
+  const p = path.join(fx.ws.provenDir, "events", "edits.jsonl");
   const lines = fs
     .readFileSync(p, "utf8")
     .split("\n")
@@ -89,7 +89,7 @@ it("E-26/S-09c: purge済みスナップショット参照はpurged=true表示、
   runPurge(fx.ws, new Date("2001-01-01"));
   exportProvenance(fx.ws);
   const prov = fs
-    .readFileSync(path.join(fx.ws.airevDir, "exports", "provenance.jsonl"), "utf8")
+    .readFileSync(path.join(fx.ws.provenDir, "exports", "provenance.jsonl"), "utf8")
     .split("\n")
     .filter(Boolean)
     .map((l) => JSON.parse(l));
@@ -103,16 +103,16 @@ it("E-26/S-09c: purge済みスナップショット参照はpurged=true表示、
 
 it("N-45: config llm.enabled true は送信対象プレビューを表示して反映", () => {
   fx = makeRepo();
-  initAirev(fx);
+  initProven(fx);
   const r = cli(fx.dir, ["config", "llm.enabled", "true"]);
   expect(r.code).toBe(0);
   expect(r.stdout).toContain("送信対象");
   expect(r.stdout).toContain("除外");
-  expect(readFileIn(fx, ".airev/config.yaml")).toContain("enabled: true");
+  expect(readFileIn(fx, ".proven/config.yaml")).toContain("enabled: true");
 });
 
-it("nested repo: captureは編集ファイル基準でリポジトリ解決(cwdが外側でも内側の.airevへ)", () => {
-  // 外側repo(=.airev未初期化)の中に内側repo(airev init済み)を作る
+it("nested repo: captureは編集ファイル基準でリポジトリ解決(cwdが外側でも内側の.provenへ)", () => {
+  // 外側repo(=.proven未初期化)の中に内側repo(proven init済み)を作る
   fx = makeRepo();
   const inner = path.join(fx.dir, "inner");
   fs.mkdirSync(inner);
@@ -132,7 +132,7 @@ it("nested repo: captureは編集ファイル基準でリポジトリ解決(cwd�
     tool_use_id: "t_nested",
   });
   expect(cli(fx.dir, ["capture", "--phase", "pre"], input).code).toBe(0);
-  const innerEvents = path.join(inner, ".airev", "events", "edits.jsonl");
-  expect(fs.existsSync(innerEvents)).toBe(true); // 内側の.airevに記録される
+  const innerEvents = path.join(inner, ".proven", "events", "edits.jsonl");
+  expect(fs.existsSync(innerEvents)).toBe(true); // 内側の.provenに記録される
   expect(fs.readFileSync(innerEvents, "utf8")).toContain("t_nested");
 });

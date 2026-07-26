@@ -1,21 +1,21 @@
 import fs from "node:fs";
 import path from "node:path";
-import { AirevError } from "../shared/errors.js";
+import { ProvenError } from "../shared/errors.js";
 import { defaultConfig, saveConfig } from "../shared/config.js";
 import { buildSpecIndex } from "../spec/index.js";
 import { openDb } from "../store/projections.js";
 import { eventsDir, exportsDir, logsDir, objectsDir, type Workspace } from "../store/paths.js";
 
 const GITIGNORE_ENTRIES = [
-  ".airev/events/",
-  ".airev/objects/",
-  ".airev/projections.db",
-  ".airev/logs/",
-  ".airev/exports/",
+  ".proven/events/",
+  ".proven/objects/",
+  ".proven/projections.db",
+  ".proven/logs/",
+  ".proven/exports/",
 ];
 
 export function hookCommand(phase: "pre" | "post"): string {
-  return `sh -c 'airev capture --phase ${phase} 2>>.airev/logs/capture-errors.log || true'`;
+  return `sh -c 'proven capture --phase ${phase} 2>>.proven/logs/capture-errors.log || true'`;
 }
 
 export interface InitResult {
@@ -29,15 +29,15 @@ export interface InitResult {
 export function runInit(ws: Workspace, opts: { yes: boolean; isTTY: boolean }): InitResult {
   const messages: string[] = [];
   if (!opts.yes && !opts.isTTY) {
-    throw new AirevError("input", "非対話環境です。--yes を指定してください");
+    throw new ProvenError("input", "非対話環境です。--yes を指定してください");
   }
-  const firstTime = !fs.existsSync(ws.airevDir);
-  fs.mkdirSync(ws.airevDir, { recursive: true, mode: 0o700 });
-  for (const d of [eventsDir(ws), objectsDir(ws), logsDir(ws), exportsDir(ws), path.join(ws.airevDir, "rules")]) {
+  const firstTime = !fs.existsSync(ws.provenDir);
+  fs.mkdirSync(ws.provenDir, { recursive: true, mode: 0o700 });
+  for (const d of [eventsDir(ws), objectsDir(ws), logsDir(ws), exportsDir(ws), path.join(ws.provenDir, "rules")]) {
     fs.mkdirSync(d, { recursive: true, mode: 0o700 });
   }
-  const cfgPath = path.join(ws.airevDir, "config.yaml");
-  if (!fs.existsSync(cfgPath)) saveConfig(ws.airevDir, defaultConfig());
+  const cfgPath = path.join(ws.provenDir, "config.yaml");
+  if (!fs.existsSync(cfgPath)) saveConfig(ws.provenDir, defaultConfig());
   openDb(ws).close(); // DDL適用
 
   // .gitignore(重複追記しない)
@@ -59,7 +59,7 @@ export function runInit(ws: Workspace, opts: { yes: boolean; isTTY: boolean }): 
     try {
       settings = JSON.parse(fs.readFileSync(settingsPath, "utf8"));
     } catch {
-      throw new AirevError("input", `.claude/settings.json が不正なJSONです(上書きせず中断します): ${settingsPath}`);
+      throw new ProvenError("input", `.claude/settings.json が不正なJSONです(上書きせず中断します): ${settingsPath}`);
     }
   }
   const hooksUpdated = mergeHooks(settings);
@@ -76,8 +76,8 @@ export function runInit(ws: Workspace, opts: { yes: boolean; isTTY: boolean }): 
       "仕様書にREQ-xxx形式のIDが見つかりません。要求にIDを振る運用を推奨します(無IDでも動きますが判定精度が下がります)",
     );
   }
-  messages.push("LLM送信は現在OFF。有効化は `airev config llm.enabled true`(初回に送信対象プレビューを表示)");
-  messages.push("レビュー観点の事前定義は `airev policy init`(任意)");
+  messages.push("LLM送信は現在OFF。有効化は `proven config llm.enabled true`(初回に送信対象プレビューを表示)");
+  messages.push("レビュー観点の事前定義は `proven policy init`(任意)");
   return { created: firstTime, gitignoreUpdated, hooksUpdated, reqIdsFound: spec.reqIds, messages };
 }
 

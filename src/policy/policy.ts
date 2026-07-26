@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import YAML from "yaml";
 import { z } from "zod";
-import { AirevError } from "../shared/errors.js";
+import { ProvenError } from "../shared/errors.js";
 import { loadConfig } from "../shared/config.js";
 import { sha256 } from "../shared/hash.js";
 import type { Workspace } from "../store/paths.js";
@@ -56,7 +56,7 @@ export interface PolicyLoadResult {
 }
 
 export function policyPath(ws: Workspace): string {
-  const cfg = loadConfig(ws.airevDir);
+  const cfg = loadConfig(ws.provenDir);
   return path.isAbsolute(cfg.policy.path) ? cfg.policy.path : path.join(ws.repoRoot, cfg.policy.path);
 }
 
@@ -105,7 +105,7 @@ export function loadPolicy(ws: Workspace): PolicyLoadResult | null {
     });
   }
   // learnルール(rules/*.yaml)との重複はpolicy優先+警告(E-43)
-  const learnDir = path.join(ws.airevDir, "rules");
+  const learnDir = path.join(ws.provenDir, "rules");
   if (fs.existsSync(learnDir)) {
     for (const f of fs.readdirSync(learnDir).filter((f) => f.endsWith(".yaml"))) {
       try {
@@ -141,11 +141,11 @@ expectations:
 `;
 }
 
-const GUARD_START = "<!-- airev:guard start -->";
-const GUARD_END = "<!-- airev:guard end -->";
+const GUARD_START = "<!-- proven:guard start -->";
+const GUARD_END = "<!-- proven:guard end -->";
 
 export function generateGuardPrompt(policy: Policy): string {
-  const L: string[] = [GUARD_START, "## airevレビューポリシー(自動生成・手動採用済み)", ""];
+  const L: string[] = [GUARD_START, "## provenレビューポリシー(自動生成・手動採用済み)", ""];
   if (policy.anti_patterns.length) {
     L.push("### してほしくない設計");
     for (const ap of policy.anti_patterns) L.push(`- ${ap.title}(${ap.id}): ${ap.reason}`);

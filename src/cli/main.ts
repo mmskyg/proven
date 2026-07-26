@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { Command } from "commander";
-import { AirevError } from "../shared/errors.js";
+import { ProvenError } from "../shared/errors.js";
 import { SCHEMA_VERSION } from "../shared/types.js";
 import { loadConfig, saveConfig } from "../shared/config.js";
 import { requireInitialized, workspace, git } from "../store/paths.js";
@@ -40,7 +40,7 @@ function emitResult(ctx: OutputCtx, command: string, status: "ok" | "partial" | 
 }
 
 function fail(ctx: OutputCtx, command: string, e: unknown): never {
-  const err = e instanceof AirevError ? e : new AirevError("input", String(e instanceof Error ? e.message : e));
+  const err = e instanceof ProvenError ? e : new ProvenError("input", String(e instanceof Error ? e.message : e));
   if (ctx.json) {
     process.stdout.write(
       JSON.stringify({ schema_version: SCHEMA_VERSION, command, status: "error", data: { message: err.message }, warnings: ctx.warnings }) + "\n",
@@ -51,8 +51,8 @@ function fail(ctx: OutputCtx, command: string, e: unknown): never {
   process.exit(err.exitCode);
 }
 
-function actorId(wsAirevDir: string, repoRoot: string): string {
-  const cfg = loadConfig(wsAirevDir);
+function actorId(wsProvenDir: string, repoRoot: string): string {
+  const cfg = loadConfig(wsProvenDir);
   if (cfg.reviewer_id) return cfg.reviewer_id;
   try {
     const email = git(repoRoot, ["config", "user.email"]).toString().trim();
@@ -64,7 +64,7 @@ function actorId(wsAirevDir: string, repoRoot: string): string {
 }
 
 const program = new Command();
-program.name("airev").description("AIエージェントネイティブのレビュー用CLI").version("0.1.0");
+program.name("proven").description("AIエージェントネイティブのレビュー用CLI").version("0.1.0");
 program.configureOutput({ writeErr: (s) => process.stderr.write(s) });
 program.exitOverride();
 
@@ -78,7 +78,7 @@ program
       const ws = workspace(process.cwd());
       const r = runInit(ws, { yes: opts.yes, isTTY: process.stdout.isTTY ?? false });
       emitResult(ctx, "init", "ok", r, [
-        r.created ? ".airev/ を作成しました" : ".airev/ は既に存在します(再初期化)",
+        r.created ? ".proven/ を作成しました" : ".proven/ は既に存在します(再初期化)",
         ...r.messages,
       ]);
     } catch (e) {
@@ -128,7 +128,7 @@ program
       ctx.warnings = r.warnings;
       if (r.orphanPosts > 0) ctx.warnings.push(`孤児post ${r.orphanPosts}件`);
       const size = eventFileSize(ws, "edits") + eventFileSize(ws, "analysis") + eventFileSize(ws, "decisions");
-      if (size > ROTATE_SUGGEST_BYTES) ctx.warnings.push("イベントが50MBを超えています。`airev rotate` を検討してください");
+      if (size > ROTATE_SUGGEST_BYTES) ctx.warnings.push("イベントが50MBを超えています。`proven rotate` を検討してください");
       exportProvenance(ws);
       const human = r.noop
         ? [`同一入力のため変更なし(no-op): job ${r.jobId}`]
@@ -190,8 +190,8 @@ program
       const ws = workspace(process.cwd());
       requireInitialized(ws);
       const m = assignment.match(/^(instructed|spec_support|necessity)=(.+)$/);
-      if (!m) throw new AirevError("input", "属性=値 の形式で指定してください");
-      const actor = actorId(ws.airevDir, ws.repoRoot);
+      if (!m) throw new ProvenError("input", "属性=値 の形式で指定してください");
+      const actor = actorId(ws.provenDir, ws.repoRoot);
       confirmOrigin(ws, hunk, m[1] as "instructed" | "spec_support" | "necessity", m[2], actor);
       emitResult(ctx, "confirm", "ok", { hunk, assignment, actor }, [`origin_confirmed: ${assignment} (by ${actor})`]);
     } catch (e) {
@@ -241,12 +241,12 @@ policyCmd
       const ws = workspace(process.cwd());
       requireInitialized(ws);
       const r = loadPolicy(ws);
-      if (!r) throw new AirevError("empty", "policy.yamlがありません(airev policy init)");
+      if (!r) throw new ProvenError("empty", "policy.yamlがありません(proven policy init)");
       const errors = r.lintErrors.filter((e) => !e.startsWith("警告:"));
       ctx.warnings = r.lintErrors.filter((e) => e.startsWith("警告:"));
       if (errors.length) {
         for (const e of errors) process.stderr.write(`lint: ${e}\n`);
-        throw new AirevError("input", `policy.yamlに${errors.length}件の違反があります`);
+        throw new ProvenError("input", `policy.yamlに${errors.length}件の違反があります`);
       }
       emitResult(ctx, "policy lint", "ok", { rules: r.rules.length }, [`OK: ルール${r.rules.length}件`]);
     } catch (e) {
@@ -263,7 +263,7 @@ policyCmd
       const ws = workspace(process.cwd());
       requireInitialized(ws);
       const r = loadPolicy(ws);
-      if (!r) throw new AirevError("empty", "policy.yamlがありません");
+      if (!r) throw new ProvenError("empty", "policy.yamlがありません");
       const guard = generateGuardPrompt(r.policy);
       if (opts.apply) {
         const a = applyGuard(ws, guard);
@@ -330,7 +330,7 @@ program
         lines.push(`※${v.note}`);
         if (!v.ok) {
           for (const l of lines) process.stdout.write(l + "\n");
-          throw new AirevError("corrupt", `decisionsチェーンが破損しています: ${v.brokenAt}`);
+          throw new ProvenError("corrupt", `decisionsチェーンが破損しています: ${v.brokenAt}`);
         }
       }
       emitResult(ctx, "rebuild", "ok", r, lines);
@@ -348,7 +348,7 @@ program
     try {
       const ws = workspace(process.cwd());
       requireInitialized(ws);
-      if (!["edits", "analysis", "decisions"].includes(opts.file)) throw new AirevError("input", "--file はedits|analysis|decisions");
+      if (!["edits", "analysis", "decisions"].includes(opts.file)) throw new ProvenError("input", "--file はedits|analysis|decisions");
       const r = rotate(ws, opts.file as "edits" | "analysis" | "decisions");
       emitResult(ctx, "rotate", "ok", r, [`世代切替: ${r.archived} (gen ${r.generation})`]);
     } catch (e) {
@@ -382,7 +382,7 @@ program
     try {
       const ws = workspace(process.cwd());
       requireInitialized(ws);
-      if (!opts.def) throw new AirevError("input", "--def <migration定義JSON> を指定してください(現行schemaはv1のみ)");
+      if (!opts.def) throw new ProvenError("input", "--def <migration定義JSON> を指定してください(現行schemaはv1のみ)");
       const def = JSON.parse(fs.readFileSync(opts.def, "utf8"));
       const r = runMigrate(ws, def);
       emitResult(ctx, "migrate", "ok", r, [r.noop ? "no-op(移行不要)" : `migrate: ${r.migrated}イベント変換`]);
@@ -401,7 +401,7 @@ program
     try {
       const ws = workspace(process.cwd());
       requireInitialized(ws);
-      const cfg = loadConfig(ws.airevDir);
+      const cfg = loadConfig(ws.provenDir);
       if (value === undefined) {
         const v = key.split(".").reduce<unknown>((o, k) => (o as Record<string, unknown>)?.[k], cfg);
         emitResult(ctx, "config", "ok", { key, value: v }, [`${key} = ${JSON.stringify(v)}`]);
@@ -417,7 +417,7 @@ program
       } else {
         setDeep(cfg as unknown as Record<string, unknown>, key, value);
       }
-      saveConfig(ws.airevDir, cfg);
+      saveConfig(ws.provenDir, cfg);
       emitResult(ctx, "config", "ok", { key, value }, [`${key} = ${value}`]);
     } catch (e) {
       fail(ctx, "config", e);

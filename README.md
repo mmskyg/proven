@@ -1,19 +1,19 @@
-# airev (仮称)
+# Proven
 
 AI駆動開発でのコードレビューを支援するCLIです。AIエージェントの編集を発生時点で捕捉し、
-「この変更はどの指示・仕様・AIの自律判断から生まれたか」という来歴つきでレビューできるようにします。
+「この変更はどの指示・仕様・AIの自律判断から生まれたか」という来歴(provenance)つきでレビューできるようにします。
 
-既存のAIレビューツールが「AIが指摘を増やす」方向なのに対し、airevは人間がレビューする行為そのものを支援する方向に振っています。
+既存のAIレビューツールが「AIが指摘を増やす」方向なのに対し、provenは人間がレビューする行為そのものを支援する方向に振っています。
 
 ## 何が起きるか
 
 ```
-airev init            # .airev/作成 + Claude Code hooks登録(以後は自動記録)
+proven init            # .proven/作成 + Claude Code hooks登録(以後は自動記録)
 # …Claude Codeで普通に開発…
-airev ingest          # diffと編集イベントを結合して来歴を構築
-airev triage          # 精読すべき順に提示(なぜその順位かの内訳つき)
-airev ask src/x.ts:42 # 「なぜこの変更?」を記録に聞く
-airev precheck        # レビュー依頼前の自己チェック
+proven ingest          # diffと編集イベントを結合して来歴を構築
+proven triage          # 精読すべき順に提示(なぜその順位かの内訳つき)
+proven ask src/x.ts:42 # 「なぜこの変更?」を記録に聞く
+proven precheck        # レビュー依頼前の自己チェック
 ```
 
 triageの実際の出力:
@@ -31,9 +31,9 @@ hookで捕捉できなかった変更は「uncaptured」と正直に出します
 ## インストール
 
 ```bash
-git clone <this-repo> && cd airev && npm install
-ln -s "$PWD/bin/airev.js" ~/.local/bin/airev   # PATHに通す
-airev init --yes                                # 対象リポジトリで実行
+git clone https://github.com/mmskyg/proven.git && cd proven && npm install
+ln -s "$PWD/bin/proven.js" ~/.local/bin/proven   # PATHに通す
+proven init --yes                                # 対象リポジトリで実行
 ```
 
 Node.js 20以上。SQLiteのネイティブモジュール(better-sqlite3)をビルドします。
@@ -69,12 +69,12 @@ Node.js 20以上。SQLiteのネイティブモジュール(better-sqlite3)をビ
 ### 検証済みのこと
 
 - 自動テスト104件(vitest)が通ります。イベントストアからのprojection完全再構築、事実とclaimの峻別、プロンプトインジェクションの隔離、hookが開発をブロックしないこと、来歴チェーンの改ざん検知などを含みます。
-- airev自身のリポジトリでのドッグフーディングで、指示されていないAIの自律修正をunsolicited候補として検出し、実transcriptから当時のAI説明を引用できることを確認しました。
+- proven自身のリポジトリでのドッグフーディングで、指示されていないAIの自律修正をunsolicited候補として検出し、実transcriptから当時のAI説明を引用できることを確認しました。
 
 ## 設計
 
-`.airev/events/*.jsonl`(追記専用イベント)が唯一の事実源で、SQLiteは再構築可能な派生物です。
-`airev rebuild` でイベントから全projectionを再生成でき、その際にLLM呼び出しもdiff再計算も発生しません。
+`.proven/events/*.jsonl`(追記専用イベント)が唯一の事実源で、SQLiteは再構築可能な派生物です。
+`proven rebuild` でイベントから全projectionを再生成でき、その際にLLM呼び出しもdiff再計算も発生しません。
 
 由来は排他ラベルではなく直交属性(明示指示 / 仕様支持 / 必要性分類)のclaimとして持ちます。
 検証は格付け(AI仮説 / ツール確認済 / 人間確認済)で管理し、CIを落とせるのは決定的検証だけです。

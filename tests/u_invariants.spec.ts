@@ -11,7 +11,7 @@ import { runTriage } from "../src/triage/triage.js";
 import { confirmOrigin, runAsk } from "../src/ask/ask.js";
 import { runPrecheck } from "../src/policy/precheck.js";
 import { buildAskPrompt, clampQuote, maskSecrets } from "../src/llm/masking.js";
-import { capturedEdit, cleanup, initAirev, makeRepo, manualEdit, writeTranscript, type Fixture } from "./helpers.js";
+import { capturedEdit, cleanup, initProven, makeRepo, manualEdit, writeTranscript, type Fixture } from "./helpers.js";
 import YAML from "yaml";
 
 let fx: Fixture;
@@ -25,13 +25,13 @@ function buildValueScenario(): { hunkIds: Record<string, string> } {
     "src/misc.ts": "misc1\n",
     "docs/spec.md": "# 仕様\n\nREQ-001 認証はloginGuardを使うこと。",
   });
-  initAirev(fx);
-  const cfgPath = path.join(fx.ws.airevDir, "config.yaml");
+  initProven(fx);
+  const cfgPath = path.join(fx.ws.provenDir, "config.yaml");
   const cfg = YAML.parse(fs.readFileSync(cfgPath, "utf8"));
   cfg.triage = { boundary_paths: ["src/auth/**"] };
   fs.writeFileSync(cfgPath, YAML.stringify(cfg));
   fs.writeFileSync(
-    path.join(fx.ws.airevDir, "policy.yaml"),
+    path.join(fx.ws.provenDir, "policy.yaml"),
     "anti_patterns: []\nexpectations:\n  - {type: hunk_note_required, when: unsolicited}\n",
   );
   const tr = writeTranscript(fx, "s1", [
@@ -73,13 +73,13 @@ describe("U-01: rebuild完全再現性", () => {
       return JSON.stringify(out);
     };
     const before = dump();
-    const prov1 = fs.readFileSync(path.join(fx.ws.airevDir, "exports", "provenance.jsonl"), "utf8");
+    const prov1 = fs.readFileSync(path.join(fx.ws.provenDir, "exports", "provenance.jsonl"), "utf8");
     rebuild(fx.ws);
     const after = dump();
     expect(after).toBe(before);
     // S-09b: provenance.jsonlもbyte-identical
     exportProvenance(fx.ws);
-    const prov2 = fs.readFileSync(path.join(fx.ws.airevDir, "exports", "provenance.jsonl"), "utf8");
+    const prov2 = fs.readFileSync(path.join(fx.ws.provenDir, "exports", "provenance.jsonl"), "utf8");
     expect(prov2).toBe(prov1);
   });
 });
@@ -171,11 +171,11 @@ describe("U-04/U-05: プロンプト隔離とシークレット非流出", () =>
 
   it("U-05: --json相当(provenance)はスナップショット本文を含まずhash参照のみ", () => {
     fx = makeRepo({ "a.ts": "SECRET_CONTENT_LINE\n" });
-    initAirev(fx);
+    initProven(fx);
     capturedEdit(fx, "a.ts", "SECRET_CONTENT_LINE\nmore\n");
     runIngest(fx.ws);
     exportProvenance(fx.ws);
-    const prov = fs.readFileSync(path.join(fx.ws.airevDir, "exports", "provenance.jsonl"), "utf8");
+    const prov = fs.readFileSync(path.join(fx.ws.provenDir, "exports", "provenance.jsonl"), "utf8");
     expect(prov).not.toContain("SECRET_CONTENT_LINE"); // 本文なし
     expect(prov).toContain("snapshot_refs"); // hash参照
   });
@@ -187,7 +187,7 @@ describe("U-09/S-08: 受入計測(eval)の正確性", () => {
     fx = makeRepo(
       Object.fromEntries(Array.from({ length: 13 }, (_, i) => [`f${String(i).padStart(2, "0")}.ts`, `base${i}\n`])),
     );
-    initAirev(fx);
+    initProven(fx);
     for (let i = 0; i < 8; i++) capturedEdit(fx, `f${String(i).padStart(2, "0")}.ts`, `edited${i}\n`);
     for (let i = 8; i < 11; i++) manualEdit(fx, `f${String(i).padStart(2, "0")}.ts`, `manual${i}\n`);
     for (let i = 11; i < 13; i++) {
@@ -206,7 +206,7 @@ describe("U-09/S-08: 受入計測(eval)の正確性", () => {
 
   it("eval lineage/claims: sample超過は全数切詰・正誤集計・n=0", () => {
     fx = makeRepo({ "a.ts": "x\n" });
-    initAirev(fx);
+    initProven(fx);
     capturedEdit(fx, "a.ts", "y\n");
     runIngest(fx.ws);
     const db = openDb(fx.ws);
@@ -223,7 +223,7 @@ describe("U-09/S-08: 受入計測(eval)の正確性", () => {
 
   it("eval triage-log: 記録と週次集計", () => {
     fx = makeRepo({ "a.ts": "x\n" });
-    initAirev(fx);
+    initProven(fx);
     evalTriageLog(fx.ws, { reached: true });
     evalTriageLog(fx.ws, { reached: false });
     const r = evalTriageLog(fx.ws, { reached: true });

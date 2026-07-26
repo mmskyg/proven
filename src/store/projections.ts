@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import Database from "better-sqlite3";
 import type Sqlite from "better-sqlite3";
-import { AirevError } from "../shared/errors.js";
+import { ProvenError } from "../shared/errors.js";
 import {
   ABORT_AFTER_MS,
   type ClaimEmitted,
@@ -61,7 +61,7 @@ export function openDb(ws: Workspace): Sqlite.Database {
     db.exec("CREATE VIRTUAL TABLE IF NOT EXISTS spec_fts USING fts5(req_id, heading, body, file, section)");
   } catch (e) {
     db.close();
-    throw new AirevError("corrupt", `projections.dbが破損しています。airev rebuild を実行してください: ${String(e)}`);
+    throw new ProvenError("corrupt", `projections.dbが破損しています。proven rebuild を実行してください: ${String(e)}`);
   }
   return db;
 }
@@ -73,8 +73,8 @@ export function openDbChecked(ws: Workspace): Sqlite.Database {
     db.pragma("quick_check");
     return db;
   } catch (e) {
-    if (e instanceof AirevError) throw e;
-    throw new AirevError("corrupt", `projections.dbが破損しています。airev rebuild を実行してください: ${String(e)}`);
+    if (e instanceof ProvenError) throw e;
+    throw new ProvenError("corrupt", `projections.dbが破損しています。proven rebuild を実行してください: ${String(e)}`);
   }
 }
 

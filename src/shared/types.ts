@@ -1,4 +1,4 @@
-// airev shared types — mirrors 詳細設計書 v0.3 §3
+// proven shared types — mirrors 詳細設計書 v0.3 §3
 export const SCHEMA_VERSION = 1;
 
 export interface EventEnvelope<T extends string = string, P = unknown> {

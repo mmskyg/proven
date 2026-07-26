@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import { ulid } from "ulid";
-import { AirevError } from "../shared/errors.js";
+import { ProvenError } from "../shared/errors.js";
 import { INDETERMINATE, type Finding, type OriginConfirmed } from "../shared/types.js";
 import { appendEvent } from "../store/events.js";
 import { applyEvent, openDbChecked } from "../store/projections.js";
@@ -57,12 +57,12 @@ function resolveTarget(db: ReturnType<typeof openDbChecked>, target: string): Hu
       }
     }
   }
-  throw new AirevError("empty", `対象hunkが見つかりません: ${target}`);
+  throw new ProvenError("empty", `対象hunkが見つかりません: ${target}`);
 }
 
 /** ask(F-04)。LLM OFF: 観測事実・引用のみ。4区分構造 */
 export function runAsk(ws: Workspace, target: string, _question: string): AskAnswer {
-  const cfg = loadConfig(ws.airevDir);
+  const cfg = loadConfig(ws.provenDir);
   const db = openDbChecked(ws);
   try {
     const hunk = resolveTarget(db, target);
@@ -191,12 +191,12 @@ export function confirmOrigin(
     necessity: ["essential", "incidental", "unsolicited"],
   };
   if (!allowed[attribute]?.includes(value)) {
-    throw new AirevError("input", `--confirm ${attribute} の値は ${allowed[attribute].join("|")} のいずれかです`);
+    throw new ProvenError("input", `--confirm ${attribute} の値は ${allowed[attribute].join("|")} のいずれかです`);
   }
   const db = openDbChecked(ws);
   try {
     const exists = db.prepare("SELECT 1 FROM hunks WHERE hunk_instance_id=?").get(hunkId);
-    if (!exists) throw new AirevError("empty", `対象hunkが見つかりません: ${hunkId}`);
+    if (!exists) throw new ProvenError("empty", `対象hunkが見つかりません: ${hunkId}`);
     const payload: OriginConfirmed = { hunk_ref: hunkId, attribute, confirmed_value: value, actor_id: actorId };
     const env = appendEvent(ws, "decisions", "origin_confirmed", payload);
     applyEvent(db, env);

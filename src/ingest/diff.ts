@@ -126,7 +126,7 @@ const DIFF_FLAGS = ["--diff-algorithm=myers", "--unified=0", "--no-ext-diff", "-
 
 /** git diff --no-index(固定フラグ)で2内容のhunkを取る(詳細設計書 diff契約) */
 export function gitNoIndexHunks(oldContent: string | null, newContent: string | null): RawHunk[] {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "airev-diff-"));
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "proven-diff-"));
   try {
     const aPath = path.join(dir, "a");
     const bPath = path.join(dir, "b");

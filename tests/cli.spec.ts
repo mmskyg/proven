@@ -3,7 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import { afterEach, describe, expect, it } from "vitest";
-import { cleanup, cli, initAirev, makeRepo, manualEdit, readFileIn, type Fixture } from "./helpers.js";
+import { cleanup, cli, initProven, makeRepo, manualEdit, readFileIn, type Fixture } from "./helpers.js";
 
 let fx: Fixture;
 afterEach(() => cleanup(fx));
@@ -13,13 +13,13 @@ describe("init(N-01〜N-05 / S-10)", () => {
     fx = makeRepo({ "docs/spec.md": "# s\n\nREQ-001 要件。" });
     const r = cli(fx.dir, ["init", "--yes"]);
     expect(r.code).toBe(0);
-    const cfg = readFileIn(fx, ".airev/config.yaml");
+    const cfg = readFileIn(fx, ".proven/config.yaml");
     expect(cfg).toContain("enabled: false");
-    const st = fs.statSync(path.join(fx.dir, ".airev"));
+    const st = fs.statSync(path.join(fx.dir, ".proven"));
     expect(st.mode & 0o777).toBe(0o700);
   });
 
-  it("N-03/N-04: hooksラッパー登録(既存保持)+.airev/前置の.gitignore", () => {
+  it("N-03/N-04: hooksラッパー登録(既存保持)+.proven/前置の.gitignore", () => {
     fx = makeRepo();
     const settingsPath = path.join(fx.dir, ".claude", "settings.json");
     fs.mkdirSync(path.dirname(settingsPath), { recursive: true });
@@ -29,10 +29,10 @@ describe("init(N-01〜N-05 / S-10)", () => {
     const settings = JSON.parse(readFileIn(fx, ".claude/settings.json"));
     const preCmds = settings.hooks.PreToolUse.flatMap((e: any) => e.hooks.map((h: any) => h.command));
     expect(preCmds).toContain("echo hi"); // 既存保持
-    expect(preCmds.some((c: string) => c.includes("airev capture --phase pre") && c.includes("|| true"))).toBe(true); // 失敗封じ込めラッパー
+    expect(preCmds.some((c: string) => c.includes("proven capture --phase pre") && c.includes("|| true"))).toBe(true); // 失敗封じ込めラッパー
     const gi = readFileIn(fx, ".gitignore");
-    expect(gi).toContain(".airev/events/");
-    expect(gi).toContain(".airev/objects/");
+    expect(gi).toContain(".proven/events/");
+    expect(gi).toContain(".proven/objects/");
     expect(gi).not.toMatch(/^events\/$/m); // 無関係な同名dirをignoreしない
   });
 
@@ -51,10 +51,10 @@ describe("init(N-01〜N-05 / S-10)", () => {
     cli(fx.dir, ["init", "--yes"]);
     cli(fx.dir, ["init", "--yes"]);
     const gi = readFileIn(fx, ".gitignore");
-    expect(gi.match(/\.airev\/events\//g)?.length).toBe(1);
+    expect(gi.match(/\.proven\/events\//g)?.length).toBe(1);
     const settings = JSON.parse(readFileIn(fx, ".claude/settings.json"));
     const cmds = settings.hooks.PreToolUse.flatMap((e: any) => e.hooks.map((h: any) => h.command));
-    expect(cmds.filter((c: string) => c.includes("airev capture")).length).toBe(1);
+    expect(cmds.filter((c: string) => c.includes("proven capture")).length).toBe(1);
     // 不正JSON
     cleanup(fx);
     fx = makeRepo();
@@ -82,14 +82,14 @@ describe("F-00マトリクス(S-06サブセット)", () => {
 
   it("E-21/E-34: 正常系空振りはexit 1", () => {
     fx = makeRepo({ "a.ts": "x\n" });
-    initAirev(fx);
+    initProven(fx);
     expect(cli(fx.dir, ["ingest"]).code).toBe(1); // 差分なし
     expect(cli(fx.dir, ["triage"]).code).toBe(1); // ingest未実行
   });
 
   it("E-23b: git管理外はexit 2", () => {
     fx = makeRepo();
-    const outside = fs.mkdtempSync(path.join(os.tmpdir(), "airev-outside-"));
+    const outside = fs.mkdtempSync(path.join(os.tmpdir(), "proven-outside-"));
     try {
       const r = cli(outside, ["ingest"]);
       expect(r.code).toBe(2);
@@ -100,18 +100,18 @@ describe("F-00マトリクス(S-06サブセット)", () => {
 
   it("E-49: purge不正日付はexit 2", () => {
     fx = makeRepo();
-    initAirev(fx);
+    initProven(fx);
     expect(cli(fx.dir, ["purge", "--before", "not-a-date"]).code).toBe(2);
   });
 
   it("E-02: projections.db破壊はexit 4+rebuild案内", () => {
     fx = makeRepo({ "a.ts": "x\n" });
-    initAirev(fx);
+    initProven(fx);
     manualEdit(fx, "a.ts", "y\n");
     cli(fx.dir, ["ingest"]);
-    fs.writeFileSync(path.join(fx.dir, ".airev", "projections.db"), "garbage-not-sqlite");
+    fs.writeFileSync(path.join(fx.dir, ".proven", "projections.db"), "garbage-not-sqlite");
     for (const suffix of ["-wal", "-shm"]) {
-      const f = path.join(fx.dir, ".airev", `projections.db${suffix}`);
+      const f = path.join(fx.dir, ".proven", `projections.db${suffix}`);
       if (fs.existsSync(f)) fs.rmSync(f);
     }
     const r = cli(fx.dir, ["triage"]);
@@ -121,7 +121,7 @@ describe("F-00マトリクス(S-06サブセット)", () => {
 
   it("--json純度: stdoutはJSONのみ(エンベロープ付き)", () => {
     fx = makeRepo({ "a.ts": "x\n" });
-    initAirev(fx);
+    initProven(fx);
     manualEdit(fx, "a.ts", "y\n");
     const r = cli(fx.dir, ["ingest", "--json"]);
     expect(r.code).toBe(0);
@@ -135,9 +135,9 @@ describe("F-00マトリクス(S-06サブセット)", () => {
 
   it("precheck gate: block違反でexit 10", () => {
     fx = makeRepo({ "db.ts": "clean()\n" });
-    initAirev(fx);
+    initProven(fx);
     fs.writeFileSync(
-      path.join(fx.dir, ".airev", "policy.yaml"),
+      path.join(fx.dir, ".proven", "policy.yaml"),
       'anti_patterns:\n  - id: AP-001\n    title: 生SQL\n    reason: r\n    detect: {type: regex, pattern: "SELECT .* FROM"}\n    severity: block\n',
     );
     manualEdit(fx, "db.ts", 'run("SELECT * FROM t")\n');
@@ -149,7 +149,7 @@ describe("F-00マトリクス(S-06サブセット)", () => {
 describe("capture無害性(E-08/E-10/U-06aの単体)", () => {
   it("E-08: transcript不在でもexit 0+capture-errors.logなし(正常記録)or記録", () => {
     fx = makeRepo({ "a.ts": "x\n" });
-    initAirev(fx);
+    initProven(fx);
     const input = JSON.stringify({
       session_id: "s",
       transcript_path: "/nonexistent/tr.jsonl",
@@ -164,7 +164,7 @@ describe("capture無害性(E-08/E-10/U-06aの単体)", () => {
 
   it("E-10: リポジトリ外ファイルは記録せずexit 0", () => {
     fx = makeRepo();
-    initAirev(fx);
+    initProven(fx);
     const input = JSON.stringify({
       session_id: "s",
       cwd: fx.dir,
@@ -174,16 +174,16 @@ describe("capture無害性(E-08/E-10/U-06aの単体)", () => {
     });
     const r = cli(fx.dir, ["capture", "--phase", "pre"], input);
     expect(r.code).toBe(0);
-    const p = path.join(fx.dir, ".airev", "events", "edits.jsonl");
+    const p = path.join(fx.dir, ".proven", "events", "edits.jsonl");
     expect(!fs.existsSync(p) || fs.readFileSync(p, "utf8").trim() === "").toBe(true); // 何も記録しない
   });
 
   it("U-06a単体: 壊れたstdin・objects書込不可でもexit 0", () => {
     fx = makeRepo({ "a.ts": "x\n" });
-    initAirev(fx);
+    initProven(fx);
     expect(cli(fx.dir, ["capture", "--phase", "pre"], "not json at all").code).toBe(0);
     // objects書込不可
-    const objDir = path.join(fx.dir, ".airev", "objects");
+    const objDir = path.join(fx.dir, ".proven", "objects");
     fs.chmodSync(objDir, 0o500);
     try {
       const input = JSON.stringify({
@@ -201,12 +201,12 @@ describe("capture無害性(E-08/E-10/U-06aの単体)", () => {
 
   it("U-06b: hookラッパーはバイナリ不在でも編集をブロックしない(|| true封じ込め)", () => {
     fx = makeRepo();
-    initAirev(fx);
+    initProven(fx);
     const settings = JSON.parse(readFileIn(fx, ".claude/settings.json"));
     const cmd: string = settings.hooks.PreToolUse.flatMap((e: any) => e.hooks.map((h: any) => h.command)).find((c: string) =>
-      c.includes("airev capture"),
+      c.includes("proven capture"),
     );
-    // airevバイナリが存在しない環境でラッパーコマンドを実行(PATHから消す)
+    // provenバイナリが存在しない環境でラッパーコマンドを実行(PATHから消す)
     const { execSync } = require("node:child_process") as typeof import("node:child_process");
     const code = (() => {
       try {

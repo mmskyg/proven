@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { loadConfig, matchAnyGlob } from "../shared/config.js";
-import { AirevError } from "../shared/errors.js";
+import { ProvenError } from "../shared/errors.js";
 import { sha256 } from "../shared/hash.js";
 import { getObject, isBinary, isOversize, putObject } from "../store/objects.js";
 import { git, type Workspace } from "../store/paths.js";
@@ -24,12 +24,12 @@ export interface Revision {
 }
 
 function excludedByCapture(ws: Workspace, rel: string): boolean {
-  const cfg = loadConfig(ws.airevDir);
-  if (rel === ".airev" || rel.startsWith(".airev/")) return true;
+  const cfg = loadConfig(ws.provenDir);
+  if (rel === ".proven" || rel.startsWith(".proven/")) return true;
   return matchAnyGlob(rel, cfg.capture.exclude);
 }
 
-/** worktree revision: git ls-files集合からcapture.exclude/.airevを強制除外(3.5) */
+/** worktree revision: git ls-files集合からcapture.exclude/.provenを強制除外(3.5) */
 export function buildWorktreeRevision(ws: Workspace): { rev: Revision; excludedCount: number } {
   const out = git(ws.repoRoot, ["ls-files", "--cached", "--others", "--exclude-standard"]).toString();
   const all = out.split("\n").filter((l) => l.length > 0);
@@ -60,7 +60,7 @@ export function buildCommitRevision(ws: Workspace, refspec: string): Revision {
   try {
     oid = git(ws.repoRoot, ["rev-parse", "--verify", `${refspec}^{commit}`]).toString().trim();
   } catch {
-    throw new AirevError("input", `不正なref: ${refspec}`);
+    throw new ProvenError("input", `不正なref: ${refspec}`);
   }
   const out = git(ws.repoRoot, ["ls-tree", "-r", oid]).toString();
   const entries: ManifestEntry[] = [];
@@ -84,13 +84,13 @@ export function resolveRevision(ws: Workspace, ref: string): Revision {
   if (ref.startsWith("worktree:")) {
     const hash = ref.slice("worktree:".length);
     const buf = getObject(ws, hash);
-    if (!buf) throw new AirevError("corrupt", `worktreeマニフェストが見つかりません(purge済み?): ${ref}`);
+    if (!buf) throw new ProvenError("corrupt", `worktreeマニフェストが見つかりません(purge済み?): ${ref}`);
     return { ref, manifest: JSON.parse(buf.toString()) as Manifest };
   }
   if (ref.startsWith("commit:")) {
     return buildCommitRevision(ws, ref.slice("commit:".length));
   }
-  throw new AirevError("input", `不正なrevision_ref: ${ref}`);
+  throw new ProvenError("input", `不正なrevision_ref: ${ref}`);
 }
 
 /** manifest entryの内容取得(テキスト≤5MBのみ保証=3.5)。無ければnull */

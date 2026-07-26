@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { ulid } from "ulid";
 import { loadConfig } from "../shared/config.js";
-import { AirevError } from "../shared/errors.js";
+import { ProvenError } from "../shared/errors.js";
 import { sha256 } from "../shared/hash.js";
 import {
   type HunkCreated,
@@ -44,14 +44,14 @@ export interface IngestSummary {
 }
 
 export function runIngest(ws: Workspace, opts: { range?: string } = {}): IngestSummary {
-  const cfg = loadConfig(ws.airevDir);
+  const cfg = loadConfig(ws.provenDir);
   const db = openDbChecked(ws);
   const warnings: string[] = [];
   try {
     // hookが追記した未反映イベントをprojectionへ同期(applyEventは再適用安全)
     const editsRead = readEvents(ws, "edits");
     if (editsRead.corruptLines > 0)
-      warnings.push(`edits.jsonlに破損行${editsRead.corruptLines}件(skip)。airev rebuild --verify を推奨`);
+      warnings.push(`edits.jsonlに破損行${editsRead.corruptLines}件(skip)。proven rebuild --verify を推奨`);
     const syncTx = db.transaction(() => {
       for (const env of editsRead.events) applyEvent(db, env);
     });
@@ -62,7 +62,7 @@ export function runIngest(ws: Workspace, opts: { range?: string } = {}): IngestS
     let excludedCount = 0;
     if (opts.range) {
       const m = opts.range.split("..");
-      if (m.length !== 2 || !m[0] || !m[1]) throw new AirevError("input", `--range はA..B形式で指定してください: ${opts.range}`);
+      if (m.length !== 2 || !m[0] || !m[1]) throw new ProvenError("input", `--range はA..B形式で指定してください: ${opts.range}`);
       baseRef = buildCommitRevision(ws, m[0]).ref;
       headRef = buildCommitRevision(ws, m[1]).ref;
     } else {
@@ -105,7 +105,7 @@ export function runIngest(ws: Workspace, opts: { range?: string } = {}): IngestS
       changed.push(p);
     }
     if (changed.length === 0 && skippedFiles.length === 0) {
-      throw new AirevError("empty", "対象なし(baseとheadに差分がありません)");
+      throw new ProvenError("empty", "対象なし(baseとheadに差分がありません)");
     }
 
     // pending→aborted導出(4.1)
@@ -117,7 +117,7 @@ export function runIngest(ws: Workspace, opts: { range?: string } = {}): IngestS
       base_revision_ref: baseRef,
       head_revision_ref: headRef,
       diff_algorithm: "myers",
-      tool_version: "airev/0.1.0",
+      tool_version: "proven/0.1.0",
       input_digest: inputDigest,
     };
     applyAndAppend(ws, db, "analysis", "ingest_run", runPayload);
@@ -313,7 +313,7 @@ function round2(n: number): number {
 
 // 後継判定用の正規化変更行ストア(派生キャッシュ。purge対象)
 function normStorePath(ws: Workspace): string {
-  return path.join(ws.airevDir, "exports", "hunk-norms.json");
+  return path.join(ws.provenDir, "exports", "hunk-norms.json");
 }
 function loadNormStore(ws: Workspace): Record<string, { file: string; norm: string }> {
   const p = normStorePath(ws);

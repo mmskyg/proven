@@ -1,13 +1,13 @@
 {
-  "name": "airev",
+  "name": "proven",
   "version": "0.1.0",
   "description": "AI-agent-native review CLI: provenance capture, triage, ask, precheck",
   "type": "module",
-  "bin": { "airev": "./bin/airev.js" },
+  "bin": { "proven": "./bin/proven.js" },
   "scripts": {
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
-    "airev": "tsx src/cli/main.ts"
+    "proven": "tsx src/cli/main.ts"
   },
   "engines": { "node": ">=20" },
   "dependencies": {

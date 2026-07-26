@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { ulid } from "ulid";
-import { AirevError } from "../shared/errors.js";
+import { ProvenError } from "../shared/errors.js";
 import { loadConfig, matchAnyGlob } from "../shared/config.js";
 import type { Finding } from "../shared/types.js";
 import { appendEvent } from "../store/events.js";
@@ -50,7 +50,7 @@ export function runPrecheck(ws: Workspace, opts: { skipIngest?: boolean } = {}):
   const loaded = loadPolicy(ws);
   // 不正policy: 安全側で実行中止(v0.3)。警告のみ(rule_id重複等)は続行
   if (loaded && loaded.lintErrors.some((e) => !e.startsWith("警告:"))) {
-    throw new AirevError(
+    throw new ProvenError(
       "input",
       `policy.yamlが不正なためprecheckを中止します(壊れたpolicyの一部だけで「通過」を出しません):\n  ` +
         loaded.lintErrors.join("\n  "),
@@ -64,7 +64,7 @@ export function runPrecheck(ws: Workspace, opts: { skipIngest?: boolean } = {}):
     try {
       ingestSummary = runIngest(ws);
     } catch (e) {
-      if (e instanceof AirevError && e.category === "empty") {
+      if (e instanceof ProvenError && e.category === "empty") {
         // 差分なし or 冪等no-op → 既存の最新ingestで続行
       } else throw e;
     }
@@ -75,7 +75,7 @@ export function runPrecheck(ws: Workspace, opts: { skipIngest?: boolean } = {}):
     const latest = db
       .prepare("SELECT job_id, base_revision_ref, head_revision_ref FROM ingest_runs ORDER BY ts DESC, job_id DESC LIMIT 1")
       .get() as { job_id: string; base_revision_ref: string; head_revision_ref: string } | undefined;
-    if (!latest) throw new AirevError("empty", "ingest対象がありません(差分なし)");
+    if (!latest) throw new ProvenError("empty", "ingest対象がありません(差分なし)");
 
     const base = resolveRevision(ws, latest.base_revision_ref);
     const head = resolveRevision(ws, latest.head_revision_ref);
@@ -259,7 +259,7 @@ function writePrDraft(
 ): string {
   const p = path.join(exportsDir(ws), "pr-draft.md");
   const existing = loadHunkNotes(ws);
-  const L: string[] = ["# PR説明下書き(airev precheck生成)", ""];
+  const L: string[] = ["# PR説明下書き(proven precheck生成)", ""];
   L.push("## 来歴サマリ");
   if (ingest) {
     L.push(
