@@ -1,0 +1,519 @@
+import fs from "node:fs";
+import path from "node:path";
+import { Command } from "commander";
+import { AirevError } from "../shared/errors.js";
+import { SCHEMA_VERSION } from "../shared/types.js";
+import { loadConfig, saveConfig } from "../shared/config.js";
+import { requireInitialized, workspace, git } from "../store/paths.js";
+import { runInit } from "./init.js";
+import { runCapture, type HookInput } from "../capture/capture.js";
+import { runIngest } from "../ingest/ingest.js";
+import { renderTriageText, runTriage, writeTriageMd } from "../triage/triage.js";
+import { confirmOrigin, recordFinding, renderAsk, runAsk } from "../ask/ask.js";
+import { applyGuard, generateGuardPrompt, loadPolicy, policyInitTemplate, policyPath } from "../policy/policy.js";
+import { runPrecheck } from "../policy/precheck.js";
+import { rebuild } from "../store/projections.js";
+import { rotate, verifyDecisionsChain, eventFileSize } from "../store/events.js";
+import {
+  evalAccuracy,
+  evalCaptureState,
+  evalTriageLog,
+  exportProvenance,
+  runMigrate,
+  runPurge,
+} from "../store/maintenance.js";
+import { buildSpecIndex } from "../spec/index.js";
+import { ROTATE_SUGGEST_BYTES } from "../shared/types.js";
+
+interface OutputCtx {
+  json: boolean;
+  warnings: string[];
+}
+
+function emitResult(ctx: OutputCtx, command: string, status: "ok" | "partial" | "error", data: unknown, humanLines: string[]): void {
+  if (ctx.json) {
+    process.stdout.write(JSON.stringify({ schema_version: SCHEMA_VERSION, command, status, data, warnings: ctx.warnings }) + "\n");
+  } else {
+    for (const l of humanLines) process.stdout.write(l + "\n");
+    for (const w of ctx.warnings) process.stdout.write(`⚠ ${w}\n`);
+  }
+}
+
+function fail(ctx: OutputCtx, command: string, e: unknown): never {
+  const err = e instanceof AirevError ? e : new AirevError("input", String(e instanceof Error ? e.message : e));
+  if (ctx.json) {
+    process.stdout.write(
+      JSON.stringify({ schema_version: SCHEMA_VERSION, command, status: "error", data: { message: err.message }, warnings: ctx.warnings }) + "\n",
+    );
+  } else {
+    process.stderr.write(`error: ${err.message}\n`);
+  }
+  process.exit(err.exitCode);
+}
+
+function actorId(wsAirevDir: string, repoRoot: string): string {
+  const cfg = loadConfig(wsAirevDir);
+  if (cfg.reviewer_id) return cfg.reviewer_id;
+  try {
+    const email = git(repoRoot, ["config", "user.email"]).toString().trim();
+    if (email) return email;
+  } catch {
+    /* fallthrough */
+  }
+  return "unknown";
+}
+
+const program = new Command();
+program.name("airev").description("AIエージェントネイティブのレビュー用CLI").version("0.1.0");
+program.configureOutput({ writeErr: (s) => process.stderr.write(s) });
+program.exitOverride();
+
+program
+  .command("init")
+  .description("プロジェクト初期化(F-01)")
+  .option("--yes", "非対話で既定値を使用", false)
+  .action((opts: { yes: boolean }) => {
+    const ctx: OutputCtx = { json: false, warnings: [] };
+    try {
+      const ws = workspace(process.cwd());
+      const r = runInit(ws, { yes: opts.yes, isTTY: process.stdout.isTTY ?? false });
+      emitResult(ctx, "init", "ok", r, [
+        r.created ? ".airev/ を作成しました" : ".airev/ は既に存在します(再初期化)",
+        ...r.messages,
+      ]);
+    } catch (e) {
+      fail(ctx, "init", e);
+    }
+  });
+
+program
+  .command("capture")
+  .description("hookからの編集イベント捕捉(F-02a)。常にexit 0")
+  .requiredOption("--phase <phase>", "pre|post")
+  .action((opts: { phase: string }) => {
+    // 絶対原則: 開発を止めない。どんな失敗でもexit 0
+    try {
+      const stdin = fs.readFileSync(0, "utf8");
+      const input = JSON.parse(stdin) as HookInput;
+      const ws = workspace(input.cwd ?? process.cwd());
+      requireInitialized(ws);
+      runCapture(ws, opts.phase === "post" ? "post" : "pre", input);
+    } catch {
+      /* logged inside; never block */
+    }
+    process.exit(0);
+  });
+
+program
+  .command("ingest")
+  .description("diff+編集イベントの取り込み(F-02b)")
+  .option("--range <range>", "A..B形式のcommit範囲")
+  .option("--json", "機械可読出力", false)
+  .action((opts: { range?: string; json: boolean }) => {
+    const ctx: OutputCtx = { json: opts.json, warnings: [] };
+    try {
+      const ws = workspace(process.cwd());
+      requireInitialized(ws);
+      const r = runIngest(ws, { range: opts.range });
+      ctx.warnings = r.warnings;
+      if (r.orphanPosts > 0) ctx.warnings.push(`孤児post ${r.orphanPosts}件`);
+      const size = eventFileSize(ws, "edits") + eventFileSize(ws, "analysis") + eventFileSize(ws, "decisions");
+      if (size > ROTATE_SUGGEST_BYTES) ctx.warnings.push("イベントが50MBを超えています。`airev rotate` を検討してください");
+      exportProvenance(ws);
+      const human = r.noop
+        ? [`同一入力のため変更なし(no-op): job ${r.jobId}`]
+        : [
+            `取り込み: ${r.hunks} hunks (linked ${r.linked} / uncaptured ${r.uncaptured} / broken ${r.broken})`,
+            ...(r.skippedFiles.length ? [`レビュー対象外: ${r.skippedFiles.join(", ")}`] : []),
+          ];
+      emitResult(ctx, "ingest", "ok", r, human);
+    } catch (e) {
+      fail(ctx, "ingest", e);
+    }
+  });
+
+program
+  .command("triage")
+  .description("精読順の提示(F-03)")
+  .option("--json", "機械可読出力", false)
+  .option("--md <path>", "markdownレポート出力先")
+  .action((opts: { json: boolean; md?: string }) => {
+    const ctx: OutputCtx = { json: opts.json, warnings: [] };
+    try {
+      const ws = workspace(process.cwd());
+      requireInitialized(ws);
+      const r = runTriage(ws);
+      ctx.warnings = r.warnings;
+      if (opts.md) writeTriageMd(ws, opts.md, r);
+      emitResult(ctx, "triage", "ok", r, [renderTriageText(r), ...(opts.md ? [`mdレポート: ${opts.md}`] : [])]);
+    } catch (e) {
+      fail(ctx, "triage", e);
+    }
+  });
+
+program
+  .command("ask")
+  .description("変更への質疑(F-04)")
+  .argument("<target>", "hunk_id または file:line")
+  .argument("[question]", "質問")
+  .option("--json", "機械可読出力", false)
+  .action((target: string, question: string | undefined, opts: { json: boolean }) => {
+    const ctx: OutputCtx = { json: opts.json, warnings: [] };
+    try {
+      const ws = workspace(process.cwd());
+      requireInitialized(ws);
+      const a = runAsk(ws, target, question ?? "");
+      emitResult(ctx, "ask", "ok", a, [renderAsk(a)]);
+    } catch (e) {
+      fail(ctx, "ask", e);
+    }
+  });
+
+program
+  .command("confirm")
+  .description("由来の人間確定([c]相当。origin_confirmedイベント)")
+  .argument("<hunk>", "hunk_instance_id")
+  .argument("<assignment>", "属性=値 (instructed=yes|no|unknown / spec_support=... / necessity=...)")
+  .action((hunk: string, assignment: string) => {
+    const ctx: OutputCtx = { json: false, warnings: [] };
+    try {
+      const ws = workspace(process.cwd());
+      requireInitialized(ws);
+      const m = assignment.match(/^(instructed|spec_support|necessity)=(.+)$/);
+      if (!m) throw new AirevError("input", "属性=値 の形式で指定してください");
+      const actor = actorId(ws.airevDir, ws.repoRoot);
+      confirmOrigin(ws, hunk, m[1] as "instructed" | "spec_support" | "necessity", m[2], actor);
+      emitResult(ctx, "confirm", "ok", { hunk, assignment, actor }, [`origin_confirmed: ${assignment} (by ${actor})`]);
+    } catch (e) {
+      fail(ctx, "confirm", e);
+    }
+  });
+
+program
+  .command("finding")
+  .description("指摘として記録([f]相当)")
+  .argument("<hunk>", "hunk_instance_id")
+  .argument("<note>", "指摘内容")
+  .action((hunk: string, note: string) => {
+    const ctx: OutputCtx = { json: false, warnings: [] };
+    try {
+      const ws = workspace(process.cwd());
+      requireInitialized(ws);
+      const id = recordFinding(ws, hunk, note, "manual");
+      emitResult(ctx, "finding", "ok", { finding_id: id }, [`finding記録: ${id}`]);
+    } catch (e) {
+      fail(ctx, "finding", e);
+    }
+  });
+
+const policyCmd = program.command("policy").description("レビュー観点の事前定義(F-12a)");
+policyCmd
+  .command("init")
+  .description("policy.yaml雛形を作成")
+  .action(() => {
+    const ctx: OutputCtx = { json: false, warnings: [] };
+    try {
+      const ws = workspace(process.cwd());
+      requireInitialized(ws);
+      const p = policyPath(ws);
+      if (!fs.existsSync(p)) fs.writeFileSync(p, policyInitTemplate());
+      emitResult(ctx, "policy init", "ok", { path: p }, [`policy: ${p}`]);
+    } catch (e) {
+      fail(ctx, "policy init", e);
+    }
+  });
+policyCmd
+  .command("lint")
+  .description("policy.yamlの検証(全違反列挙)")
+  .action(() => {
+    const ctx: OutputCtx = { json: false, warnings: [] };
+    try {
+      const ws = workspace(process.cwd());
+      requireInitialized(ws);
+      const r = loadPolicy(ws);
+      if (!r) throw new AirevError("empty", "policy.yamlがありません(airev policy init)");
+      const errors = r.lintErrors.filter((e) => !e.startsWith("警告:"));
+      ctx.warnings = r.lintErrors.filter((e) => e.startsWith("警告:"));
+      if (errors.length) {
+        for (const e of errors) process.stderr.write(`lint: ${e}\n`);
+        throw new AirevError("input", `policy.yamlに${errors.length}件の違反があります`);
+      }
+      emitResult(ctx, "policy lint", "ok", { rules: r.rules.length }, [`OK: ルール${r.rules.length}件`]);
+    } catch (e) {
+      fail(ctx, "policy lint", e);
+    }
+  });
+policyCmd
+  .command("guard")
+  .description("ガードプロンプト生成(--applyでCLAUDE.mdマーカー区間を置換)")
+  .option("--apply", "CLAUDE.mdへ適用", false)
+  .action((opts: { apply: boolean }) => {
+    const ctx: OutputCtx = { json: false, warnings: [] };
+    try {
+      const ws = workspace(process.cwd());
+      requireInitialized(ws);
+      const r = loadPolicy(ws);
+      if (!r) throw new AirevError("empty", "policy.yamlがありません");
+      const guard = generateGuardPrompt(r.policy);
+      if (opts.apply) {
+        const a = applyGuard(ws, guard);
+        emitResult(ctx, "policy guard", "ok", a, [`適用しました: ${a.target}`]);
+      } else {
+        emitResult(ctx, "policy guard", "ok", { guard }, [guard]);
+      }
+    } catch (e) {
+      fail(ctx, "policy guard", e);
+    }
+  });
+
+program
+  .command("precheck")
+  .description("提出前セルフチェック(F-12b)")
+  .option("--json", "機械可読出力(AIエージェント連携形式)", false)
+  .option("--quiet", "要約のみ", false)
+  .action((opts: { json: boolean; quiet: boolean }) => {
+    const ctx: OutputCtx = { json: opts.json, warnings: [] };
+    try {
+      const ws = workspace(process.cwd());
+      requireInitialized(ws);
+      const r = runPrecheck(ws);
+      ctx.warnings = r.warnings;
+      const human: string[] = [];
+      const blocks = r.findings.filter((f) => f.lens === "anti_pattern" && f.severity === "block" && f.outcome === "fail");
+      const warns = r.findings.filter((f) => f.lens === "anti_pattern" && f.severity === "warn");
+      for (const f of blocks) human.push(`✖ ${f.rule_ref} ${f.location?.file}:${f.location?.line} ${f.reason} (block)`);
+      if (!opts.quiet) {
+        for (const f of warns) human.push(`△ ${f.rule_ref ?? f.lens} ${f.location ? `${f.location.file}:${f.location.line} ` : ""}${f.reason}`);
+        for (const u of r.unsolicited)
+          human.push(`⚠ 頼んでいない変更: ${u.file}:${u.line} ${u.noted ? "(注記あり)" : "(注記なし)"} — ${u.reason}`);
+        for (const e of r.expectations) {
+          const mark = e.satisfied === null ? "·" : e.satisfied ? "✓" : "✗";
+          human.push(`[${mark}] ${e.type}: ${e.detail}`);
+        }
+      }
+      human.push(`PR説明下書き: ${r.prDraftPath}`);
+      emitResult(ctx, "precheck", "ok", r, human);
+      if (r.gate) process.exit(10);
+    } catch (e) {
+      fail(ctx, "precheck", e);
+    }
+  });
+
+program
+  .command("rebuild")
+  .description("イベントストアからprojection全再構築(F-11)")
+  .option("--verify", "decisionsチェーン検証", false)
+  .action((opts: { verify: boolean }) => {
+    const ctx: OutputCtx = { json: false, warnings: [] };
+    try {
+      const ws = workspace(process.cwd());
+      requireInitialized(ws);
+      const r = rebuild(ws);
+      if (r.corruptLines > 0) ctx.warnings.push(`破損行${r.corruptLines}件をskipしました`);
+      if (r.orphanPosts > 0) ctx.warnings.push(`孤児post ${r.orphanPosts}件`);
+      buildSpecIndex(ws); // spec_indexは仕様ファイルから決定的に再構築
+      exportProvenance(ws);
+      const lines = [`rebuild完了: ${r.applied}イベント適用`];
+      if (opts.verify) {
+        const v = verifyDecisionsChain(ws);
+        lines.push(v.ok ? `チェーン検証OK (${v.checkedRows}行)` : `チェーン検証NG: ${v.brokenAt}`);
+        lines.push(`※${v.note}`);
+        if (!v.ok) {
+          for (const l of lines) process.stdout.write(l + "\n");
+          throw new AirevError("corrupt", `decisionsチェーンが破損しています: ${v.brokenAt}`);
+        }
+      }
+      emitResult(ctx, "rebuild", "ok", r, lines);
+    } catch (e) {
+      fail(ctx, "rebuild", e);
+    }
+  });
+
+program
+  .command("rotate")
+  .description("イベントファイルの世代切替(F-11)")
+  .option("--file <file>", "edits|analysis|decisions", "edits")
+  .action((opts: { file: string }) => {
+    const ctx: OutputCtx = { json: false, warnings: [] };
+    try {
+      const ws = workspace(process.cwd());
+      requireInitialized(ws);
+      if (!["edits", "analysis", "decisions"].includes(opts.file)) throw new AirevError("input", "--file はedits|analysis|decisions");
+      const r = rotate(ws, opts.file as "edits" | "analysis" | "decisions");
+      emitResult(ctx, "rotate", "ok", r, [`世代切替: ${r.archived} (gen ${r.generation})`]);
+    } catch (e) {
+      fail(ctx, "rotate", e);
+    }
+  });
+
+program
+  .command("purge")
+  .description("スナップショット・派生キャッシュの削除(イベントは削除しない)")
+  .requiredOption("--before <date>", "この日付より古い参照のスナップショットを削除")
+  .action((opts: { before: string }) => {
+    const ctx: OutputCtx = { json: false, warnings: [] };
+    try {
+      const ws = workspace(process.cwd());
+      requireInitialized(ws);
+      const d = new Date(opts.before);
+      const r = runPurge(ws, d);
+      emitResult(ctx, "purge", "ok", r, [`purge: 削除${r.deleted} / 保持${r.kept}`]);
+    } catch (e) {
+      fail(ctx, "purge", e);
+    }
+  });
+
+program
+  .command("migrate")
+  .description("schema移行(機構の骨格)")
+  .option("--def <path>", "migration定義JSON")
+  .action((opts: { def?: string }) => {
+    const ctx: OutputCtx = { json: false, warnings: [] };
+    try {
+      const ws = workspace(process.cwd());
+      requireInitialized(ws);
+      if (!opts.def) throw new AirevError("input", "--def <migration定義JSON> を指定してください(現行schemaはv1のみ)");
+      const def = JSON.parse(fs.readFileSync(opts.def, "utf8"));
+      const r = runMigrate(ws, def);
+      emitResult(ctx, "migrate", "ok", r, [r.noop ? "no-op(移行不要)" : `migrate: ${r.migrated}イベント変換`]);
+    } catch (e) {
+      fail(ctx, "migrate", e);
+    }
+  });
+
+program
+  .command("config")
+  .description("設定の取得・変更")
+  .argument("<key>")
+  .argument("[value]")
+  .action((key: string, value?: string) => {
+    const ctx: OutputCtx = { json: false, warnings: [] };
+    try {
+      const ws = workspace(process.cwd());
+      requireInitialized(ws);
+      const cfg = loadConfig(ws.airevDir);
+      if (value === undefined) {
+        const v = key.split(".").reduce<unknown>((o, k) => (o as Record<string, unknown>)?.[k], cfg);
+        emitResult(ctx, "config", "ok", { key, value: v }, [`${key} = ${JSON.stringify(v)}`]);
+        return;
+      }
+      if (key === "llm.enabled" && value === "true") {
+        // 送信対象プレビュー(9.1)
+        process.stdout.write("LLM送信を有効化します。送信対象:\n");
+        process.stdout.write("  - diff抜粋 / user・AI発話の引用(前後200文字切詰・シークレットマスク済み)\n");
+        process.stdout.write("  - 仕様書該当節の抜粋\n");
+        process.stdout.write(`  除外: llm.exclude=${JSON.stringify(cfg.llm.exclude)}\n`);
+        cfg.llm.enabled = true;
+      } else {
+        setDeep(cfg as unknown as Record<string, unknown>, key, value);
+      }
+      saveConfig(ws.airevDir, cfg);
+      emitResult(ctx, "config", "ok", { key, value }, [`${key} = ${value}`]);
+    } catch (e) {
+      fail(ctx, "config", e);
+    }
+  });
+
+function setDeep(obj: Record<string, unknown>, key: string, raw: string): void {
+  const parts = key.split(".");
+  let cur = obj;
+  for (const p of parts.slice(0, -1)) {
+    if (typeof cur[p] !== "object" || cur[p] === null) cur[p] = {};
+    cur = cur[p] as Record<string, unknown>;
+  }
+  const last = parts[parts.length - 1];
+  let v: unknown = raw;
+  if (raw === "true") v = true;
+  else if (raw === "false") v = false;
+  else if (/^\d+(\.\d+)?$/.test(raw)) v = Number(raw);
+  cur[last] = v;
+}
+
+const evalCmd = program.command("eval").description("受入計測(基本設計11章)");
+evalCmd
+  .command("capture-state")
+  .description("uncaptured/broken率の状態別集計")
+  .action(() => {
+    const ctx: OutputCtx = { json: false, warnings: [] };
+    try {
+      const ws = workspace(process.cwd());
+      requireInitialized(ws);
+      const r = evalCaptureState(ws);
+      emitResult(ctx, "eval capture-state", "ok", r, r.lines);
+    } catch (e) {
+      fail(ctx, "eval capture-state", e);
+    }
+  });
+evalCmd
+  .command("lineage")
+  .option("--sample <n>", "サンプル数", "50")
+  .option("--answers <path>", "正誤入力JSON({id: true/false})")
+  .action((opts: { sample: string; answers?: string }) => {
+    const ctx: OutputCtx = { json: false, warnings: [] };
+    try {
+      const ws = workspace(process.cwd());
+      requireInitialized(ws);
+      const answers = opts.answers ? JSON.parse(fs.readFileSync(opts.answers, "utf8")) : {};
+      const r = evalAccuracy(ws, "lineage", Number(opts.sample), answers);
+      emitResult(ctx, "eval lineage", "ok", r, r.lines);
+    } catch (e) {
+      fail(ctx, "eval lineage", e);
+    }
+  });
+evalCmd
+  .command("claims")
+  .option("--sample <n>", "サンプル数", "50")
+  .option("--answers <path>", "正誤入力JSON")
+  .action((opts: { sample: string; answers?: string }) => {
+    const ctx: OutputCtx = { json: false, warnings: [] };
+    try {
+      const ws = workspace(process.cwd());
+      requireInitialized(ws);
+      const answers = opts.answers ? JSON.parse(fs.readFileSync(opts.answers, "utf8")) : {};
+      const r = evalAccuracy(ws, "claims", Number(opts.sample), answers);
+      emitResult(ctx, "eval claims", "ok", r, r.lines);
+    } catch (e) {
+      fail(ctx, "eval claims", e);
+    }
+  });
+evalCmd
+  .command("triage-log")
+  .option("--reached <bool>", "今日のレビューで重要変更に先に到達できたか(true/false)")
+  .option("--note <note>")
+  .action((opts: { reached?: string; note?: string }) => {
+    const ctx: OutputCtx = { json: false, warnings: [] };
+    try {
+      const ws = workspace(process.cwd());
+      requireInitialized(ws);
+      const entry = opts.reached !== undefined ? { reached: opts.reached === "true", note: opts.note } : undefined;
+      const r = evalTriageLog(ws, entry);
+      emitResult(ctx, "eval triage-log", "ok", r, [`記録${r.entries}件 / 到達率 ${r.reachedRate}`]);
+    } catch (e) {
+      fail(ctx, "eval triage-log", e);
+    }
+  });
+
+program
+  .command("spec-index")
+  .description("仕様書インデックス再構築")
+  .action(() => {
+    const ctx: OutputCtx = { json: false, warnings: [] };
+    try {
+      const ws = workspace(process.cwd());
+      requireInitialized(ws);
+      const r = buildSpecIndex(ws);
+      emitResult(ctx, "spec-index", "ok", r, [`spec: ${r.files}ファイル/${r.paragraphs}段落/REQ ${r.reqIds}件`]);
+    } catch (e) {
+      fail(ctx, "spec-index", e);
+    }
+  });
+
+try {
+  await program.parseAsync(process.argv);
+} catch (e) {
+  const err = e as { code?: string; exitCode?: number };
+  if (err.code === "commander.helpDisplayed" || err.code === "commander.version") process.exit(0);
+  if (typeof err.code === "string" && err.code.startsWith("commander.")) process.exit(2); // 未知コマンド/不正フラグ(E-07)
+  process.stderr.write(`error: ${String(e)}\n`);
+  process.exit(2);
+}
