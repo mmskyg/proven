@@ -318,7 +318,11 @@ export function attributionBasis(
   };
 }
 
-export function buildCasePack(ws: Workspace, kind: EvalKind, sample: number): EvalCasePack {
+/**
+ * REQ-708: 最新のingestで付与されたclaimだけを対象にする(判定ロジックを変更した直後、
+ * 旧ロジックで付いた過去のclaimを混ぜると、変更後の実力が測れないため)。
+ */
+export function buildCasePack(ws: Workspace, kind: EvalKind, sample: number, latestOnly = false): EvalCasePack {
   const db = openDbChecked(ws);
   try {
     const latest = db
@@ -430,9 +434,10 @@ export function buildCasePack(ws: Workspace, kind: EvalKind, sample: number): Ev
                   h.base_revision_ref, h.head_revision_ref, h.edit_capture_status, h.lineage_status,
                   h.context_status, h.confidence AS hconf
            FROM claims c JOIN hunks h ON h.hunk_instance_id = c.hunk_ref
-           WHERE c.kind IN ('instructed','spec_support') ORDER BY c.claim_id`,
+           WHERE c.kind IN ('instructed','spec_support')${latestOnly ? " AND h.ingest_job_id = ?" : ""}
+           ORDER BY c.claim_id`,
         )
-        .all() as (HunkRow & {
+        .all(...(latestOnly ? [latest.job_id] : [])) as (HunkRow & {
         claim_id: string;
         hunk_ref: string;
         kind: string;

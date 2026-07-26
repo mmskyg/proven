@@ -482,12 +482,13 @@ for (const kind of ["lineage", "claims"] as const) {
     )
     .option("--emit-cases", "判定用ケースをJSONで出力(AIエージェントに渡す)", false)
     .option("--sample <n>", "サンプル数", "50")
+    .option("--latest-only", "最新ingestで付与されたclaimのみ対象(判定ロジック変更後の実測用)", false)
     .option("--submit <path>", "判定JSONを取り込む")
     .option("--judge <who>", "判定者: ai(未検証扱い) | human(確認済み扱い)", "human")
     .option("--model <name>", "judge=ai のとき判定に使ったモデル名")
     .option("--report", "集計(AI判定と人間確認を分離表示)", false)
     .option("--json", "機械可読出力", false)
-    .action((opts: { emitCases: boolean; sample: string; submit?: string; judge: string; model?: string; report: boolean; json: boolean }) => {
+    .action((opts: { emitCases: boolean; sample: string; latestOnly?: boolean; submit?: string; judge: string; model?: string; report: boolean; json: boolean }) => {
       const ctx: OutputCtx = { json: opts.json, warnings: [] };
       const cmdName = `eval ${kind}`;
       try {
@@ -495,7 +496,7 @@ for (const kind of ["lineage", "claims"] as const) {
         requireInitialized(ws);
         if (opts.emitCases) {
           // AIエージェントがそのまま読める形式。--json有無に関わらずstdoutはJSONのみ
-          const pack = buildCasePack(ws, kind, Number(opts.sample));
+          const pack = buildCasePack(ws, kind, Number(opts.sample), Boolean(opts.latestOnly));
           process.stdout.write(JSON.stringify(pack, null, 2) + "\n");
           return;
         }
