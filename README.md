@@ -1,27 +1,95 @@
-# airev (仮称) — AIエージェントネイティブのレビュー用CLI
+# airev (仮称)
 
-AI駆動開発のレビューボトルネックを解消するCLI。編集イベントをhookで発生時捕捉し、
-変更の来歴(誰が・どの指示/仕様/AI判断で)を提示、レビュー前に開発者へフィードバックを返す。
+AI駆動開発でのコードレビューを支援するCLIです。AIエージェントの編集を発生時点で捕捉し、
+「この変更はどの指示・仕様・AIの自律判断から生まれたか」という来歴つきでレビューできるようにします。
 
-- 設計書: Notion「AIレビューCLI」プロジェクト(基本v0.6 / 機能v0.7 / 詳細v0.3 / テストv0.3)
-- Phase 1 (MVP) 実装済み: capture / ingest(lineage+claims) / triage / ask / policy / precheck / rebuild / rotate / purge / migrate / eval
-- LLMは既定OFF(ヒューリスティックのみで動作)。LLMプロバイダ層はオプトイン実装予定
+既存のAIレビューツールが「AIが指摘を増やす」方向なのに対し、airevは人間がレビューする行為そのものを支援する方向に振っています。
 
-## 使い方(最小)
+## 何が起きるか
+
+```
+airev init            # .airev/作成 + Claude Code hooks登録(以後は自動記録)
+# …Claude Codeで普通に開発…
+airev ingest          # diffと編集イベントを結合して来歴を構築
+airev triage          # 精読すべき順に提示(なぜその順位かの内訳つき)
+airev ask src/x.ts:42 # 「なぜこの変更?」を記録に聞く
+airev precheck        # レビュー依頼前の自己チェック
+```
+
+triageの実際の出力:
+
+```
+◆ 精読推奨順
+  1. src/cli/main.ts:98 [unsolicited-candidate+30] 計30
+     来歴: captured/linked  instructed=なし / spec=判定不能 / necessity=unsolicited候補
+     経緯: 明示指示なし+仕様支持判定不能(判定不能由来の低confidence推定)
+```
+
+設計上の要は、推定を事実として断定しないことです。由来が判断できないときは「判定不能」と表示し、
+hookで捕捉できなかった変更は「uncaptured」と正直に出します。推定にはconfidenceと根拠が必ず付きます。
+
+## インストール
 
 ```bash
-airev init --yes          # .airev/作成 + Claude Code hooks登録
-# …Claude Codeで開発(編集が自動捕捉される)…
-airev ingest              # diff+来歴構築
-airev triage              # 精読順の提示
-airev ask src/x.ts:42     # 「なぜこの変更?」を記録に聞く
-airev precheck            # 提出前セルフチェック(policy.yaml基準)
+git clone <this-repo> && cd airev && npm install
+ln -s "$PWD/bin/airev.js" ~/.local/bin/airev   # PATHに通す
+airev init --yes                                # 対象リポジトリで実行
 ```
+
+Node.js 20以上。SQLiteのネイティブモジュール(better-sqlite3)をビルドします。
+
+## 制限事項(重要)
+
+**このツールはPhase 1(MVP)であり、中核仮説の検証がまだ終わっていません。**
+「AIの編集を発生時捕捉すれば来歴を実用精度で提示できる」という前提自体が未実証です。以下を承知の上でお使いください。
+
+### 精度が未計測
+
+- **受入基準の実測をしていません。** 設計上の目標は「hunk→編集イベントの対応付け正解率90%以上」「claim根拠の妥当率80%以上」ですが、実プロジェクトでのサンプル検証は未実施です。
+- 由来判定(instructed / spec_support)はキーワード一致のヒューリスティックです。言い回しが指示と違えば「なし」に倒れます。誤判定の頻度は未計測です。
+- 仕様照合は仕様書に `REQ-xxx` 形式のIDがある前提で効きます。ID運用がないリポジトリでは「判定不能」が多くなります。
+
+### 未実装(設計にはあるが動かない)
+
+- **LLM層**: 既定OFFで、プロバイダ実装自体がありません。`llm.enabled=true` にしても高精度claimやaskの推測セクションは出ません。シークレットマスキングとプロンプト隔離の実装だけ先行しています。
+- **Phase 2以降の全機能**: レビューTUI(`review`)、検証バッテリー(`verify`)、承認記録(`attest`)、ルール学習(`learn`)、文体lint(`docstyle`)、メトリクス(`report`)は未着手です。
+- `ingest` の `--resume`、LLM予算オプション(`--max-llm-calls` / `--budget`)、lineageの時間予算による中断は未実装です。編集履歴が多いファイルで処理時間が伸びる可能性があります。
+- triageの「被参照数」加点は常に無効です(実装が空)。加点表の他の項目は動作します。
+- policyの `detect.type: ast` はTS/JSのみの想定ですが、MVPで実際に動くのは `regex` だけです。`ast` と `llm` はskipped表示になります。
+- 300行超のhunkは分割されません(oversizeフラグと警告のみ)。
+
+### 仕組み上の限界
+
+- **hook外の変更は捕捉できません。** 手編集、formatter、シェル経由の書き換えはuncaptured / brokenになります。これは仕様であり、推定で埋めません。実運用でuncapturedが何割になるかは未計測です。
+- **改ざん耐性はありません。** 承認記録は追記専用のチェーンハッシュですが、ローカルファイルである以上「本人の作業記録」であり監査証跡ではありません。検出できるのは後続行が存在する行の改変だけです。
+- **Claude Code専用**です。他のAIエージェントのログ形式には未対応です。
+- renameは追跡せず、削除+追加として扱います。
+- 性能は実測していません。captureのp95 50ms以内などは設計上の想定値です。
+
+### 検証済みのこと
+
+- 自動テスト104件(vitest)が通ります。イベントストアからのprojection完全再構築、事実とclaimの峻別、プロンプトインジェクションの隔離、hookが開発をブロックしないこと、来歴チェーンの改ざん検知などを含みます。
+- airev自身のリポジトリでのドッグフーディングで、指示されていないAIの自律修正をunsolicited候補として検出し、実transcriptから当時のAI説明を引用できることを確認しました。
+
+## 設計
+
+`.airev/events/*.jsonl`(追記専用イベント)が唯一の事実源で、SQLiteは再構築可能な派生物です。
+`airev rebuild` でイベントから全projectionを再生成でき、その際にLLM呼び出しもdiff再計算も発生しません。
+
+由来は排他ラベルではなく直交属性(明示指示 / 仕様支持 / 必要性分類)のclaimとして持ちます。
+検証は格付け(AI仮説 / ツール確認済 / 人間確認済)で管理し、CIを落とせるのは決定的検証だけです。
+レビュアーは `policy.yaml` で観点と禁止設計を事前定義し、開発者は `precheck` でレビュー前にフィードバックを受けます。
+
+詳細な設計文書(基本設計・機能設計・詳細設計・テスト仕様)は非公開です。
 
 ## テスト
 
 ```bash
-npm test   # vitest: 98 tests
+npm test        # vitest 104件
+npm run typecheck
 ```
 
-<!-- dogfood: manual edit without hook -->
+## ライセンス
+
+**未定です。** LICENSEファイルを置いていないため、現時点では著作権者が全権利を保持します。
+利用や再配布を検討される場合は作者にご相談ください。

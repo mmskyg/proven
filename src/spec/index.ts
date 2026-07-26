@@ -76,7 +76,20 @@ export function buildSpecIndex(ws: Workspace): SpecIndexResult {
 }
 
 export function tokenize(text: string): string[] {
-  return (text.match(/[A-Za-z_][A-Za-z0-9_]{2,}|[ぁ-んァ-ヶ一-龠]{2,}/g) ?? []).map((t) => t.toLowerCase());
+  const out: string[] = [];
+  for (const m of text.match(/[A-Za-z_][A-Za-z0-9_]{2,}|[ぁ-んァ-ヶ一-龠]{2,}/g) ?? []) {
+    if (/^[A-Za-z_]/.test(m)) {
+      out.push(m.toLowerCase());
+      continue;
+    }
+    // 日本語は貪欲マッチで長大な塊になり一致が取れないため2-gramへ分解する。
+    // 助詞・活用語尾の誤ヒットを避けるため漢字・カタカナを含むgramのみ採る。
+    for (let i = 0; i + 2 <= m.length; i++) {
+      const g = m.slice(i, i + 2);
+      if (/[ァ-ヶ一-龠]/.test(g)) out.push(g);
+    }
+  }
+  return out;
 }
 
 export interface SpecHit {

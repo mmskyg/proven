@@ -354,3 +354,35 @@ describe("claims(N-26〜N-30 / E-30〜E-32)", () => {
   });
 });
 
+
+describe("日本語トークン化(ドッグフーディングで発見した誤判定の回帰テスト)", () => {
+  it("日本語の指示と日本語コンテンツでinstructed=ありになる", () => {
+    fx = makeRepo({ "README.md": "# タイトル\n\n本文\n" });
+    initAirev(fx);
+    const tr = writeTranscript(fx, "s1", [
+      { role: "user", text: "制限事項として未検証のところを明示的にREADMEに書いてください" },
+    ]);
+    capturedEdit(fx, "README.md", "# タイトル\n\n## 制限事項\n\n受入基準の実測は未検証です。\n", { transcript: tr });
+    runIngest(fx.ws);
+    const db = openDb(fx.ws);
+    const ins = db.prepare("SELECT value, reason FROM claims WHERE kind='instructed'").get() as {
+      value: string;
+      reason: string;
+    };
+    db.close();
+    // 修正前は日本語が長大トークンになり一致せず「なし」→unsolicited誤判定になっていた
+    expect(ins.value).toBe("あり");
+  });
+
+  it("無関係な日本語発話では「なし」のまま(過剰一致していない)", () => {
+    fx = makeRepo({ "src/app.ts": "l1\nl2\n" });
+    initAirev(fx);
+    const tr = writeTranscript(fx, "s1", [{ role: "user", text: "今日の天気はどうですか" }]);
+    capturedEdit(fx, "src/app.ts", "l1\nl2\nconst cacheLayer = init()\n", { transcript: tr });
+    runIngest(fx.ws);
+    const db = openDb(fx.ws);
+    const ins = db.prepare("SELECT value FROM claims WHERE kind='instructed'").get() as { value: string };
+    db.close();
+    expect(ins.value).toBe("なし");
+  });
+});
