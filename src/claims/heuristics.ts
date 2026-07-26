@@ -75,6 +75,18 @@ export interface HunkTargets {
   fileNames: string[];
   /** 変更行に含まれる固有識別子(汎用語を除く) */
   symbols: string[];
+  /** 変更行が明示参照しているREQ-ID(コメント等)。最も強い紐づけ根拠(REQ-709) */
+  reqRefs: string[];
+}
+
+/**
+ * 断定に使える「特徴的な」対象語か(REQ-709)。
+ * 実測で、日本語2-gramの断片(「方が」「の組」「る場」)や短い英単語が
+ * 無関係な発話と一致して誤断定を生んでいた。断定にはこの条件を課す。
+ */
+export function isDistinctiveTarget(t: string): boolean {
+  if (GENERIC_TOKENS.has(t)) return false;
+  return isCjkToken(t) ? t.length >= 4 : t.length >= 6;
 }
 
 /** hunkの「変更対象」を取り出す(REQ-703)。汎用語は対象一致に数えない */
@@ -82,7 +94,9 @@ export function hunkTargets(file: string, hunk: RawHunk): HunkTargets {
   const base = file.split("/").pop() ?? file;
   const stem = base.replace(/\.[^.]+$/, "");
   const symbols = new Set<string>();
+  const reqRefs = new Set<string>();
   for (const l of [...hunk.addedLines, ...hunk.removedLines]) {
+    for (const m of l.match(/REQ-\d+/g) ?? []) reqRefs.add(m);
     for (const t of tokenize(l)) {
       // 日本語は2-gramで切られるため、ASCII識別子と同じ長さ閾値にすると全部落ちる
       if (!isCjkToken(t) && t.length < 4) continue;
@@ -90,8 +104,10 @@ export function hunkTargets(file: string, hunk: RawHunk): HunkTargets {
       if (t === stem.toLowerCase() || t === base.toLowerCase()) continue;
       symbols.add(t);
     }
+    // 日本語は2-gramでは断片すぎるため、連続する日本語列そのものも対象語に持つ
+    for (const run of l.match(/[぀-ヿ一-鿿]{4,}/g) ?? []) symbols.add(run.toLowerCase());
   }
-  return { fileNames: [base.toLowerCase(), stem.toLowerCase()], symbols: [...symbols] };
+  return { fileNames: [base.toLowerCase(), stem.toLowerCase()], symbols: [...symbols], reqRefs: [...reqRefs] };
 }
 
 /** 後方互換: 従来の識別子一覧(仕様検索の候補抽出に使う) */
@@ -121,9 +137,9 @@ export function instructionMatch(
   utterance: string,
   targets: HunkTargets,
 ): { matched: boolean; hitSymbols: string[]; hitFiles: string[] } {
-  const hitSymbols = targets.symbols.filter((s) => containsToken(utterance, s));
+  // REQ-709: 断定に使うのは特徴的な対象語のみ(短い語・日本語2-gram断片は除外)
+  const hitSymbols = targets.symbols.filter((s) => isDistinctiveTarget(s) && containsToken(utterance, s));
   const hitFiles = targets.fileNames.filter((f) => f && containsToken(utterance, f));
-  // 固有識別子が2つ以上、またはファイル名+固有識別子の組で「対象が特定されている」とみなす
   const targetIdentified = hitSymbols.length >= 2 || (hitFiles.length > 0 && hitSymbols.length >= 1);
   return { matched: targetIdentified, hitSymbols, hitFiles };
 }
@@ -230,13 +246,19 @@ export function emitClaimsForHunk(ws: Workspace, db: Sqlite.Database, input: Cla
     // 「既存テストが通ること」のような一般的要求に技術名が含まれるだけで紐づくのを防ぐ
     const paragraph = specParagraph(ws, hit.section) ?? "";
     const targets = hunkTargets(input.file, input.hunk);
-    const bodyHits = [...targets.symbols, ...targets.fileNames].filter(
-      (t) => t && t.length >= 4 && paragraph.toLowerCase().includes(t),
-    );
+    // REQ-709: 最も強い根拠は、変更行がそのREQ-IDを明示参照していること
+    const explicitRef = targets.reqRefs.includes(hit.req_id);
+    const bodyHits = explicitRef
+      ? [hit.req_id]
+      : [...targets.symbols, ...targets.fileNames].filter(
+          (t) => t && isDistinctiveTarget(t) && paragraph.toLowerCase().includes(t),
+        );
     if (bodyHits.length > 0) {
       specValue = "支持";
       specConf = HEURISTIC_CONF_MAX;
-      specReason = `仕様${hit.req_id}(${hit.heading})の本文が変更対象(${bodyHits.slice(0, 3).join(", ")})に言及`;
+      specReason = explicitRef
+        ? `変更行が仕様${hit.req_id}(${hit.heading})を明示参照`
+        : `仕様${hit.req_id}(${hit.heading})の本文が変更対象(${bodyHits.slice(0, 3).join(", ")})に言及`;
       specEvidence = [{ type: "spec", file: hit.file, req_id: hit.req_id, section: hit.section }];
     } else {
       specReason = `候補仕様${hit.req_id}は見つかったが、本文に変更対象への言及がない(関連語一致のみ)`;

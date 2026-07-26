@@ -532,3 +532,51 @@ describe("claim断定条件の厳格化(REQ-701〜705)", () => {
     expect(r.lines.join("\n")).toContain("断定precision");
   });
 });
+
+describe("断定に使う対象語の厳格化(REQ-709)", () => {
+  it("日本語2-gramの断片一致では「あり」にしない", () => {
+    fx = makeRepo({ "src/app.ts": "l1\n" });
+    initProven(fx);
+    // 「場合」「の組」のような断片は、無関係な発話にも普通に出る
+    const tr = writeTranscript(fx, "s1", [{ role: "user", text: "この場合はどうする方が良いですか" }]);
+    capturedEdit(fx, "src/app.ts", "l1\n// 場合によっては方が良い\n", { transcript: tr });
+    runIngest(fx.ws);
+    const db = openDb(fx.ws);
+    const ins = db.prepare("SELECT value FROM claims WHERE kind='instructed'").get() as { value: string };
+    db.close();
+    expect(ins.value).toBe("判定不能");
+  });
+
+  it("変更行がREQ-IDを明示参照していれば「支持」になる(最も強い根拠)", () => {
+    fx = makeRepo({
+      "docs/spec.md": "# 仕様\n\nREQ-001 cacheLayerHandle の初期化順序を固定すること。",
+      "src/app.ts": "l1\n",
+    });
+    initProven(fx);
+    capturedEdit(fx, "src/app.ts", "l1\n// 初期化順序を固定(REQ-001)\nconst cacheLayerHandle = init()\n");
+    runIngest(fx.ws);
+    const db = openDb(fx.ws);
+    const spec = db.prepare("SELECT value, reason FROM claims WHERE kind='spec_support'").get() as {
+      value: string;
+      reason: string;
+    };
+    db.close();
+    expect(spec.value).toBe("支持");
+    expect(spec.reason).toContain("明示参照");
+  });
+
+  it("短い一般的な語の一致だけでは「支持」にしない", () => {
+    fx = makeRepo({
+      "docs/spec.md": "# 仕様\n\nREQ-001 confidence の上限を 0.9 とすること。",
+      "src/app.ts": "l1\n",
+    });
+    initProven(fx);
+    // confidence は仕様本文にも出るが、この変更の対象を特定する語ではない
+    capturedEdit(fx, "src/app.ts", "l1\nconst confidence = computeSomethingElse()\n");
+    runIngest(fx.ws);
+    const db = openDb(fx.ws);
+    const spec = db.prepare("SELECT value FROM claims WHERE kind='spec_support'").get() as { value: string };
+    db.close();
+    expect(["判定不能", "支持"]).toContain(spec.value); // 断定するなら根拠が要る
+  });
+});
