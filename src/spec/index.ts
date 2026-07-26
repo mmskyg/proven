@@ -121,6 +121,23 @@ export interface SpecHit {
   score: number;
 }
 
+/**
+ * REQ-IDを直接引く(REQ-710)。
+ * 変更行がREQ-IDを明示参照しているなら、FTSの類似検索より確実な紐づけになる。
+ */
+export function lookupReq(ws: Workspace, reqId: string): SpecHit | null {
+  const db = openDb(ws);
+  try {
+    const row = db
+      .prepare("SELECT req_id, file, section, heading FROM spec_index WHERE req_id=? LIMIT 1")
+      .get(reqId) as { req_id: string; file: string; section: string; heading: string } | undefined;
+    if (!row) return null;
+    return { req_id: row.req_id, file: row.file, section: row.section, heading: row.heading, snippet: "", score: 1 };
+  } finally {
+    db.close();
+  }
+}
+
 /** FTS検索(claims spec_support用)。ヒットなしはnull */
 export function searchSpec(ws: Workspace, queryTokens: string[]): SpecHit | null {
   if (queryTokens.length === 0) return null;

@@ -11,7 +11,7 @@ import {
 import { appendEvent } from "../store/events.js";
 import { applyEvent } from "../store/projections.js";
 import type { Workspace } from "../store/paths.js";
-import { searchSpec, specParagraph, tokenize } from "../spec/index.js";
+import { lookupReq, searchSpec, specParagraph, tokenize } from "../spec/index.js";
 import { adapterById, claudeCodeAdapter } from "../agents/index.js";
 import type { RawHunk } from "../ingest/diff.js";
 import type { HunkAttribution } from "../ingest/lineage.js";
@@ -233,7 +233,11 @@ export function emitClaimsForHunk(ws: Workspace, db: Sqlite.Database, input: Cla
   emittedKinds.push("instructed");
 
   // --- spec_support ---
-  const hit = searchSpec(ws, identifiers);
+  // REQ-710: 変更行がREQ-IDを明示参照しているなら、その要求だけを見る。
+  // FTSの類似検索は別の要求を拾いうるため、明示参照があるときは検索結果を使わない
+  const specTargets = hunkTargets(input.file, input.hunk);
+  const explicitReq = specTargets.reqRefs.map((r) => lookupReq(ws, r)).find((r) => r !== null) ?? null;
+  const hit = explicitReq ?? searchSpec(ws, identifiers);
   let specValue = INDETERMINATE;
   let specConf = 0;
   let specReason = "";
@@ -245,15 +249,19 @@ export function emitClaimsForHunk(ws: Workspace, db: Sqlite.Database, input: Cla
     // REQ-704: FTSヒットは候補抽出まで。段落本文にhunkの対象が現れない一致は「支持」にしない。
     // 「既存テストが通ること」のような一般的要求に技術名が含まれるだけで紐づくのを防ぐ
     const paragraph = specParagraph(ws, hit.section) ?? "";
-    const targets = hunkTargets(input.file, input.hunk);
-    // REQ-709: 最も強い根拠は、変更行がそのREQ-IDを明示参照していること
+    const targets = specTargets;
+    // REQ-709/710: 最も強い根拠は、変更行がそのREQ-IDを明示参照していること
     const explicitRef = targets.reqRefs.includes(hit.req_id);
+    // 明示参照があるのに別のREQが候補に挙がった場合は断定しない(取り違えの防止・REQ-710)
+    const refMismatch = !explicitRef && targets.reqRefs.length > 0;
     const bodyHits = explicitRef
       ? [hit.req_id]
       : [...targets.symbols, ...targets.fileNames].filter(
           (t) => t && isDistinctiveTarget(t) && paragraph.toLowerCase().includes(t),
         );
-    if (bodyHits.length > 0) {
+    if (refMismatch) {
+      specReason = `変更行は${targets.reqRefs.slice(0, 2).join(", ")}を参照しているが、候補仕様(${hit.req_id})と一致しない`;
+    } else if (bodyHits.length > 0) {
       specValue = "支持";
       specConf = HEURISTIC_CONF_MAX;
       specReason = explicitRef

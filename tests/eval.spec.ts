@@ -580,3 +580,44 @@ describe("断定に使う対象語の厳格化(REQ-709)", () => {
     expect(["判定不能", "支持"]).toContain(spec.value); // 断定するなら根拠が要る
   });
 });
+
+describe("REQ明示参照の取り違え防止(REQ-710)", () => {
+  it("変更行が参照しているREQと候補仕様が違うときは「支持」にしない", () => {
+    fx = makeRepo({
+      "docs/spec.md":
+        "# 仕様\n\nREQ-001 cacheLayerHandle の初期化順序を固定すること。\n\nREQ-002 別件の要求。ここには特徴的な語 distinctiveMarkerToken を置く。",
+      "src/app.ts": "l1\n",
+    });
+    initProven(fx);
+    // 変更行はREQ-001を参照しているのに、語の一致ではREQ-002が拾われうる状況
+    capturedEdit(fx, "src/app.ts", "l1\n// distinctiveMarkerToken の扱い(REQ-001)\nconst x = 1\n");
+    runIngest(fx.ws);
+    const db = openDb(fx.ws);
+    const spec = db.prepare("SELECT value, reason FROM claims WHERE kind='spec_support'").get() as {
+      value: string;
+      reason: string;
+    };
+    db.close();
+    // REQ-001を参照しているので、REQ-002で「支持」と言ってはいけない
+    if (spec.value === "支持") expect(spec.reason).toContain("REQ-001");
+  });
+});
+
+describe("仕様索引の自動更新(REQ-711)", () => {
+  it("仕様書を更新するとingest時に索引が作り直される", () => {
+    fx = makeRepo({ "docs/spec.md": "# 仕様\n\nREQ-001 最初の要求。", "src/app.ts": "l1\n" });
+    initProven(fx);
+    // init後に仕様書へ新しい要求を追加する
+    fs.writeFileSync(
+      path.join(fx.dir, "docs/spec.md"),
+      "# 仕様\n\nREQ-001 最初の要求。\n\nREQ-002 cacheLayerHandle を buildCacheLayer で初期化すること。",
+    );
+    capturedEdit(fx, "src/app.ts", "l1\nconst cacheLayerHandle = buildCacheLayer(opts)\n");
+    const r = runIngest(fx.ws);
+    expect(r.warnings.join("\n")).toContain("索引を再構築");
+    const db = openDb(fx.ws);
+    const n = db.prepare("SELECT COUNT(*) c FROM spec_index WHERE req_id='REQ-002'").get() as { c: number };
+    db.close();
+    expect(n.c).toBeGreaterThan(0); // 新しい要求が索引に入っている
+  });
+});

@@ -25,6 +25,7 @@ import {
 } from "./diff.js";
 import { attributeHunk, computeFileLineage, isSessionEnded } from "./lineage.js";
 import { buildWorktreeRevision, buildCommitRevision, fileContent, manifestMap, repoId, resolveRevision } from "./revision.js";
+import { buildSpecIndex, specDigest } from "../spec/index.js";
 import { emitClaimsForHunk } from "../claims/heuristics.js";
 
 export interface IngestSummary {
@@ -58,6 +59,24 @@ export function runIngest(ws: Workspace, opts: { range?: string } = {}): IngestS
       for (const env of editsRead.events) applyEvent(db, env);
     });
     syncTx();
+    // REQ-711: 仕様書が変わっていたら索引を作り直す。
+    // initでしか索引を作らないと、仕様を更新しても古い索引で照合され、
+    // 「REQ-xxxが見つからない」という誤った理由が出る(実際に発生した)
+    try {
+      const digest = specDigest(ws);
+      const prev = (db.prepare("SELECT value FROM meta WHERE key='spec_digest'").get() as { value: string } | undefined)
+        ?.value;
+      if (digest && digest !== prev) {
+        buildSpecIndex(ws);
+        db.prepare("INSERT INTO meta(key,value) VALUES('spec_digest',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").run(
+          digest,
+        );
+        warnings.push("仕様書の変更を検出したため索引を再構築しました");
+      }
+    } catch (e) {
+      warnings.push(`仕様索引の再構築に失敗しました(既存の索引で継続): ${String(e)}`);
+    }
+
     // 端点決定
     let baseRef: string;
     let headRef: string;
