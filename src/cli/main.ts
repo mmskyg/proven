@@ -95,7 +95,17 @@ program
     try {
       const stdin = fs.readFileSync(0, "utf8");
       const input = JSON.parse(stdin) as HookInput;
-      const ws = workspace(input.cwd ?? process.cwd());
+      // リポジトリ解決は編集ファイル基準(ネストしたgitリポジトリでcwd基準だと
+      // 外側リポジトリへ誤帰属するため)。解決不能時のみcwdへフォールバック
+      const rawFile = (input.tool_input?.file_path ?? input.tool_input?.notebook_path) as string | undefined;
+      const cwd = input.cwd ?? process.cwd();
+      let ws;
+      try {
+        const abs = rawFile ? (path.isAbsolute(rawFile) ? rawFile : path.join(cwd, rawFile)) : cwd;
+        ws = workspace(fs.existsSync(abs) && fs.statSync(abs).isDirectory() ? abs : path.dirname(abs));
+      } catch {
+        ws = workspace(cwd);
+      }
       requireInitialized(ws);
       runCapture(ws, opts.phase === "post" ? "post" : "pre", input);
     } catch {

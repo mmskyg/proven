@@ -23,3 +23,5 @@ airev precheck            # 提出前セルフチェック(policy.yaml基準)
 ```bash
 npm test   # vitest: 98 tests
 ```
+
+<!-- dogfood: manual edit without hook -->

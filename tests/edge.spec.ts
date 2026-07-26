@@ -110,3 +110,29 @@ it("N-45: config llm.enabled true は送信対象プレビューを表示して�
   expect(r.stdout).toContain("除外");
   expect(readFileIn(fx, ".airev/config.yaml")).toContain("enabled: true");
 });
+
+it("nested repo: captureは編集ファイル基準でリポジトリ解決(cwdが外側でも内側の.airevへ)", () => {
+  // 外側repo(=.airev未初期化)の中に内側repo(airev init済み)を作る
+  fx = makeRepo();
+  const inner = path.join(fx.dir, "inner");
+  fs.mkdirSync(inner);
+  spawnSync("git", ["init", "-q"], { cwd: inner });
+  spawnSync("git", ["-C", inner, "config", "user.email", "t@e.com"]);
+  spawnSync("git", ["-C", inner, "config", "user.name", "t"]);
+  fs.writeFileSync(path.join(inner, "a.ts"), "x\n");
+  spawnSync("git", ["-C", inner, "add", "-A"]);
+  spawnSync("git", ["-C", inner, "commit", "-qm", "i"]);
+  const r0 = cli(inner, ["init", "--yes"]);
+  expect(r0.code).toBe(0);
+  const input = JSON.stringify({
+    session_id: "s",
+    cwd: fx.dir, // ← 外側をcwdにする(ネスト誤帰属の再現条件)
+    tool_name: "Edit",
+    tool_input: { file_path: path.join(inner, "a.ts") },
+    tool_use_id: "t_nested",
+  });
+  expect(cli(fx.dir, ["capture", "--phase", "pre"], input).code).toBe(0);
+  const innerEvents = path.join(inner, ".airev", "events", "edits.jsonl");
+  expect(fs.existsSync(innerEvents)).toBe(true); // 内側の.airevに記録される
+  expect(fs.readFileSync(innerEvents, "utf8")).toContain("t_nested");
+});

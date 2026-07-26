@@ -1,2 +1,7 @@
 node_modules/
 .airev/
+.airev/events/
+.airev/objects/
+.airev/projections.db
+.airev/logs/
+.airev/exports/
