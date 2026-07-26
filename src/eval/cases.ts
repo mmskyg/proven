@@ -255,7 +255,7 @@ export function buildCasePack(ws: Workspace, kind: EvalKind, sample: number): Ev
         const links = db
           .prepare(
             `SELECT e.operation_id, e.agent, e.ts_pre, e.ts_post, e.session_ref, e.transcript_line, e.status,
-                    e.pre_blob_hash, e.result_blob_hash
+                    e.pre_blob_hash, e.result_blob_hash, l.support
              FROM lineage_links l JOIN edit_events e ON e.operation_id = l.operation_id
              WHERE l.hunk_instance_id = ? AND e.file = ? ORDER BY e.ts_pre`,
           )
@@ -269,6 +269,7 @@ export function buildCasePack(ws: Workspace, kind: EvalKind, sample: number): Ev
           status: string;
           pre_blob_hash: string | null;
           result_blob_hash: string | null;
+          support: string | null;
         }[];
         // 同ファイルの他イベント(誤帰属を見抜くための対照証拠)
         const otherEvents = db
@@ -304,7 +305,9 @@ export function buildCasePack(ws: Workspace, kind: EvalKind, sample: number): Ev
               lineage_status: h.lineage_status,
               context_status: h.context_status,
               confidence: h.confidence,
-              attributed_events: links.map((l) => l.operation_id),
+              // REQ-507: 判定者が「作った/触っただけ」を区別できるようにする
+            attributed_events: links.map((l) => l.operation_id),
+            attributed_events_support: links.map((l) => ({ operation_id: l.operation_id, support: l.support ?? "unknown" })),
             },
             cause_claim: causeClaim ?? null,
           },
@@ -316,6 +319,7 @@ export function buildCasePack(ws: Workspace, kind: EvalKind, sample: number): Ev
               agent: l.agent,
               edited_at: l.ts_pre,
               status: l.status,
+              support: l.support ?? "unknown",
               attribution_basis: attributionBasis(ws, l, hunkBody),
               transcript_quotes: quoteAround(l.session_ref, l.transcript_line),
             })),

@@ -205,3 +205,62 @@ describe("下流の扱い(REQ-411)", () => {
     expect(text).toContain("判定不能");
   });
 });
+
+describe("帰属イベントの内容裏付け(REQ-501〜507)", () => {
+  it("同じ範囲を触っただけの編集はtouched、行を作った編集はauthorになる", () => {
+    // A が特徴的な行を追加 → B が近くの行を書き換え → C が元に戻す
+    // 最終diffに残るのはAの行だけ。BとCは範囲は重なるが最終変更を作っていない
+    const base = `${filler(5)}\nshared-line-original-content\n`;
+    const afterA = `${filler(5)}\n${A}\nshared-line-original-content\n`;
+    const afterB = `${filler(5)}\n${A}\nshared-line-temporarily-edited\n`;
+    const afterC = `${filler(5)}\n${A}\nshared-line-original-content\n`;
+    const lineage = computeFileLineage(base, afterC, [
+      { operationId: "opA", pre: base, post: afterA },
+      { operationId: "opB", pre: afterA, post: afterB },
+      { operationId: "opC", pre: afterB, post: afterC },
+    ]);
+    const hunks = gitNoIndexHunks(base, afterC);
+    const attr = attributeHunk(lineage, hunks[0]);
+    expect(attr.status).toBe("linked");
+    const sup = Object.fromEntries((attr.refSupport ?? []).map((s) => [s.operation_id, s.support]));
+    expect(sup.opA).toBe("author"); // Aはこの行を作った
+    // BとCは最終的な変更行を作っていない(触っただけ)。挙がっていればtouchedであること
+    for (const op of ["opB", "opC"]) if (sup[op]) expect(sup[op]).toBe("touched");
+  });
+
+  it("askはauthorとtouchedを分けて表示し、touchedを著者として出さない(REQ-504)", () => {
+    fx = makeRepo({ "src/a.ts": `${filler(5)}\n` });
+    initProven(fx);
+    capturedEdit(fx, "src/a.ts", `${filler(5)}\n${A}\nneighbor-line-original\n`, { toolUseId: "tu_author" });
+    capturedEdit(fx, "src/a.ts", `${filler(5)}\n${A}\nneighbor-line-edited\n`, { toolUseId: "tu_toucher" });
+    runIngest(fx.ws, {});
+
+    const db = openDb(fx.ws);
+    const h = db.prepare("SELECT file, new_start FROM hunks WHERE lineage_status='linked' LIMIT 1").get() as {
+      file: string;
+      new_start: number;
+    };
+    const sup = db
+      .prepare("SELECT operation_id, support FROM lineage_links WHERE support IS NOT NULL")
+      .all() as { operation_id: string; support: string }[];
+    db.close();
+    expect(sup.length).toBeGreaterThan(0); // supportが永続化される(REQ-503)
+
+    const text = runAsk(fx.ws, `${h.file}:${h.new_start}`, "なぜ?").sections.observed.join("\n");
+    if (text.includes("同じ範囲を触っただけの編集")) {
+      // touchedがある場合、authorの見出しより後に出る(混ぜない)
+      expect(text.indexOf("この変更を作った編集")).toBeLessThan(text.indexOf("同じ範囲を触っただけの編集"));
+    }
+    expect(text).toContain("この変更を作った編集");
+  });
+
+  it("authorが1件も無いときは著者を断定しない(REQ-505)", () => {
+    // 帰属はされるが、一致するのが定型行だけのケース(情報量ゼロ=著者と断定しない)
+    const base = "aaa-original-line\n";
+    const afterA = "aaa-original-line\n}\n";
+    const lineage = computeFileLineage(base, afterA, [{ operationId: "opA", pre: base, post: afterA }]);
+    const attr = attributeHunk(lineage, gitNoIndexHunks(base, afterA)[0]);
+    const supports = (attr.refSupport ?? []).map((s) => s.support);
+    expect(supports.every((s) => s === "touched")).toBe(true);
+  });
+});

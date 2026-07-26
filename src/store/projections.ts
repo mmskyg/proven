@@ -39,6 +39,7 @@ CREATE TABLE IF NOT EXISTS hunks (
 CREATE TABLE IF NOT EXISTS hunk_lineage (predecessor_id TEXT, successor_id TEXT, similarity REAL,
   PRIMARY KEY(predecessor_id, successor_id));
 CREATE TABLE IF NOT EXISTS lineage_links (hunk_instance_id TEXT, operation_id TEXT,
+  support TEXT,
   PRIMARY KEY(hunk_instance_id, operation_id));
 CREATE TABLE IF NOT EXISTS claims (claim_id TEXT PRIMARY KEY, hunk_ref TEXT, kind TEXT,
   value TEXT, confidence REAL, reason TEXT, run_id TEXT, evidence_json TEXT);
@@ -57,6 +58,13 @@ CREATE TABLE IF NOT EXISTS eval_judgments (judgment_id TEXT PRIMARY KEY, kind TE
   verdict TEXT, reason TEXT, judge TEXT, actor_id TEXT, model TEXT, verification_level TEXT, ts TEXT);
 CREATE INDEX IF NOT EXISTS idx_eval_case ON eval_judgments(kind, case_id, judge);
 `;
+
+/** lineage_links.support 列の追加(REQ-503)。既存DBは非破壊でALTER */
+function migrateLineageLinks(db: Sqlite.Database): void {
+  const cols = db.prepare("PRAGMA table_info(lineage_links)").all() as { name: string }[];
+  if (cols.length === 0 || cols.some((c) => c.name === "support")) return;
+  db.exec("ALTER TABLE lineage_links ADD COLUMN support TEXT");
+}
 
 /**
  * edit_events を旧スキーマ(PRIMARY KEY=operation_id / agent_detection列なし)から
@@ -91,6 +99,7 @@ export function openDb(ws: Workspace): Sqlite.Database {
   try {
     db.exec(DDL);
     migrateEditEvents(db);
+    migrateLineageLinks(db);
     db.exec("CREATE VIRTUAL TABLE IF NOT EXISTS spec_fts USING fts5(req_id, heading, body, file, section)");
   } catch (e) {
     db.close();
@@ -186,10 +195,13 @@ export function applyEvent(db: Sqlite.Database, env: EventEnvelope): void {
         db.prepare(
           `UPDATE hunks SET edit_capture_status='captured', lineage_status=?, context_status=?, method=?, confidence=? WHERE hunk_instance_id=?`,
         ).run(p.lineage_status, p.context_status, p.method, p.confidence, p.hunk_instance_id);
+        // 各refの内容裏付け(author=この変更を作った / touched=同じ範囲を触っただけ・REQ-501/503)
+        const support = new Map((p.edit_event_support ?? []).map((s) => [s.operation_id, s.support]));
         for (const op of p.edit_event_refs) {
-          db.prepare(`INSERT INTO lineage_links(hunk_instance_id, operation_id) VALUES (?,?) ON CONFLICT DO NOTHING`).run(
-            p.hunk_instance_id, op,
-          );
+          db.prepare(
+            `INSERT INTO lineage_links(hunk_instance_id, operation_id, support) VALUES (?,?,?)
+             ON CONFLICT(hunk_instance_id, operation_id) DO UPDATE SET support=excluded.support`,
+          ).run(p.hunk_instance_id, op, support.get(op) ?? null);
         }
       } else {
         db.prepare(

@@ -92,6 +92,8 @@ export type LineageLinked =
       /** candidateはblob-chainではなく内容一致で導出される(REQ-402) */
       method: "blob-chain" | "content-match";
       confidence: number;
+      /** 各refの内容裏付け(REQ-501/503)。author=この変更を作った / touched=同じ範囲を触っただけ */
+      edit_event_support?: { operation_id: string; support: "author" | "touched" | "unknown" }[];
     }
   | {
       hunk_instance_id: string;

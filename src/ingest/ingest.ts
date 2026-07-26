@@ -257,6 +257,7 @@ export function runIngest(ws: Workspace, opts: { range?: string } = {}): IngestS
             edit_event_refs: attr.refs,
             method: attr.method ?? "blob-chain",
             confidence: attr.confidence ?? 0.4,
+            edit_event_support: attr.refSupport,
           };
         }
         applyAndAppend(ws, db, "analysis", "lineage_linked", linkEvent);

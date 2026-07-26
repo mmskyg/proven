@@ -210,6 +210,29 @@ export interface HunkAttribution {
     bothSides: boolean;
     ambiguous: boolean;
   };
+  /**
+   * 各refについて、その編集自身の差分がhunkの変更行を含むか(REQ-501)。
+   * 位置が重なる≠その行を書いた、を区別するための観測事実。
+   */
+  refSupport?: { operation_id: string; support: RefSupport }[];
+}
+
+export type RefSupport = "author" | "touched" | "unknown";
+
+/** refごとの内容裏付けを判定する(REQ-501/502)。新しい推定は増やさず、既存の突き合わせ規則をそのまま使う */
+export function refSupportOf(contents: EventContent[], refs: string[], hunk: RawHunk): {
+  operation_id: string;
+  support: RefSupport;
+}[] {
+  return refs.map((id) => {
+    const c = contents.find((x) => x.operationId === id);
+    if (!c) return { operation_id: id, support: "unknown" as RefSupport };
+    const matched = [
+      ...multisetIntersect(hunk.addedLines, c.addedLines),
+      ...multisetIntersect(hunk.removedLines, c.removedLines),
+    ].filter(isInformativeLine);
+    return { operation_id: id, support: (matched.length > 0 ? "author" : "touched") as RefSupport };
+  });
 }
 
 const CANDIDATE_CONF_MAX = 0.4;
@@ -292,12 +315,28 @@ export function attributeHunk(lineage: FileLineage, hunk: RawHunk): HunkAttribut
       break;
     }
   }
-  // 既存の構造的判定は変更しない(REQ-412)。candidateはuncapturedだった一部だけを引き取る
+  // 既存の構造的判定は変更しない(REQ-412/506)。candidateはuncapturedだった一部だけを引き取る
   if (hitUntainted.size > 0) {
-    return { status: "linked", refs: [...hitUntainted, ...hitTainted], confidence: 1.0, gapCause: null, method: "blob-chain" };
+    const refs = [...hitUntainted, ...hitTainted];
+    return {
+      status: "linked",
+      refs,
+      confidence: 1.0,
+      gapCause: null,
+      method: "blob-chain",
+      refSupport: refSupportOf(lineage.eventContents, refs, hunk),
+    };
   }
   if (hitTainted.size > 0) {
-    return { status: "broken", refs: [...hitTainted], confidence: 0.4, gapCause, method: "blob-chain" };
+    const refs = [...hitTainted];
+    return {
+      status: "broken",
+      refs,
+      confidence: 0.4,
+      gapCause,
+      method: "blob-chain",
+      refSupport: refSupportOf(lineage.eventContents, refs, hunk),
+    };
   }
   const candidate = findContentCandidates(lineage.eventContents, hunk);
   if (candidate) {
@@ -308,6 +347,8 @@ export function attributeHunk(lineage: FileLineage, hunk: RawHunk): HunkAttribut
       gapCause,
       method: "content-match",
       candidateEvidence: candidate.evidence,
+      // candidateは内容一致で選ばれているので、定義上すべてauthor(候補)
+      refSupport: refSupportOf(lineage.eventContents, candidate.refs, hunk),
     };
   }
   return { status: "uncaptured", refs: [], confidence: null, gapCause };

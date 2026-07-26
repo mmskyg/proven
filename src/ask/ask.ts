@@ -77,7 +77,7 @@ export function runAsk(ws: Workspace, target: string, _question: string): AskAns
 
     const links = db
       .prepare(
-        `SELECT e.operation_id, e.agent, e.ts_pre, e.session_ref, e.transcript_line
+        `SELECT DISTINCT e.operation_id, e.agent, e.ts_pre, e.session_ref, e.transcript_line, l.support
          FROM lineage_links l JOIN edit_events e ON e.operation_id=l.operation_id
          WHERE l.hunk_instance_id=? ORDER BY e.ts_pre ASC`,
       )
@@ -87,6 +87,7 @@ export function runAsk(ws: Workspace, target: string, _question: string): AskAns
       ts_pre: string;
       session_ref: string;
       transcript_line: number | null;
+      support: string | null;
     }[];
 
     if (hunk.edit_capture_status === "uncaptured") {
@@ -106,11 +107,28 @@ export function runAsk(ws: Workspace, target: string, _question: string): AskAns
       }
       if (links.length > 1) observed.push("候補が複数あり、どれが作ったかは決められません(ambiguous)");
     } else {
-      for (const l of links) {
-        observed.push(
-          `${l.ts_pre} のedit_event ${l.operation_id.slice(0, 12)}… で ${l.agent} が編集` +
-            (hunk.lineage_status === "broken" ? "(broken: 近傍参考情報)" : ""),
-        );
+      // 位置が重なる≠その行を書いた。内容の裏付けで分けて出す(REQ-504)
+      const authors = links.filter((l) => l.support === "author");
+      const touched = links.filter((l) => l.support === "touched");
+      const unknown = links.filter((l) => l.support !== "author" && l.support !== "touched");
+      const line = (l: (typeof links)[number]): string =>
+        `${l.ts_pre} のedit_event ${l.operation_id.slice(0, 12)}… (${l.agent})` +
+        (hunk.lineage_status === "broken" ? "(broken: 近傍参考情報)" : "");
+      if (authors.length > 0) {
+        observed.push("この変更を作った編集:");
+        for (const l of authors) observed.push(`  ${line(l)}`);
+      }
+      if (touched.length > 0) {
+        observed.push("同じ範囲を触っただけの編集(この変更は作っていません):");
+        for (const l of touched) observed.push(`  ${line(l)}`);
+      }
+      if (unknown.length > 0) {
+        observed.push("内容の裏付けを判定できなかった編集:");
+        for (const l of unknown) observed.push(`  ${line(l)}`);
+      }
+      // REQ-505: 著者を特定できていないなら、そう言う
+      if (authors.length === 0 && links.length > 0) {
+        observed.push("範囲は重なりますが、この変更を作った編集は特定できていません");
       }
       if (links.length === 0) observed.push("帰属イベントの詳細を取得できませんでした");
     }
