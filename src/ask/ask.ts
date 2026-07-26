@@ -86,7 +86,12 @@ export function runAsk(ws: Workspace, target: string, _question: string): AskAns
     }[];
 
     if (hunk.edit_capture_status === "uncaptured") {
-      observed.push("経緯情報なし: この変更はhook捕捉外(手編集・formatter等)で発生しました(uncaptured)");
+      // REQ-310: 「hook外で発生した」と断定しない。観測できたのは「対応する捕捉イベントを確認できない」まで。
+      // 途中の編集が記録されていないと連鎖が切れ、捕捉済みの編集があってもここへ落ちうる。
+      observed.push(
+        "経緯情報なし: この変更に対応する捕捉イベントを確認できません(uncaptured)。" +
+          "hook外の変更(手編集・formatter等)か、途中の編集が記録されず連鎖が切れた可能性があります",
+      );
     } else {
       for (const l of links) {
         observed.push(

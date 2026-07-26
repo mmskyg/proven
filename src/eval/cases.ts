@@ -43,7 +43,10 @@ const LINEAGE_RUBRIC = [
   "判定は提示された証拠のみに基づいてください。証拠にない事実を仮定しないこと。",
   // REQ-304: 帰属判定は会話ではなくblobチェーンで行っているため、機械的証拠を主とする
   "主たる証拠は attribution_basis です。これは編集前後の内容ハッシュ(blobチェーン)と、そのイベント自身が作った差分です。",
-  "attribution_basis.overlap が full/partial なら、そのイベントがhunkの変更行を実際に作ったことを意味します。",
+  // REQ-308: overlapは「同じ文字列の変更行が含まれる」までしか意味しない。帰属の十分条件ではない
+  "attribution_basis.overlap は『そのイベントの差分に、hunkと同じ文字列の変更行が含まれる』ことのみを意味します。",
+  "overlap は帰属の十分条件ではありません。頻出行(`}` や `return null;` 等)の偶然一致、formatterによる削除・再追加、" +
+    "一度作られた行が消えて別の主体が同じ文字列を再追加したケースがあり得ます。位置・重複・後続変更を併せて判断してください。",
   "会話引用(transcript_quotes)は補助証拠です。引用が無いこと自体はunsureの理由になりません(帰属判定は会話に依存しません)。",
   "other_events_on_same_file は対照証拠です。非帰属イベントの方がhunkをよく説明できる場合はincorrectを検討してください。",
 ];
@@ -144,8 +147,54 @@ export interface AttributionBasis {
   event_diff: string;
   introduced_lines: string[];
   removed_lines: string[];
+  /** 一致行のうち情報量のあるもの(頻出の定型行を除く)の数。証拠の強さの目安(REQ-309) */
+  informative_matches: number;
   overlap: "full" | "partial" | "none" | "unknown";
+  /** overlapの意味を限定する注記。過剰な結論を防ぐ(REQ-308) */
+  overlap_note: string;
 }
+
+/**
+ * 一致行の情報量判定(REQ-309)。
+ * `}` `);` `return null;` のような定型行は偶然一致しやすく、単独では証拠にならない。
+ */
+const KEYWORDS = new Set([
+  "return", "null", "true", "false", "else", "const", "let", "var", "new", "this", "void", "undefined",
+  "if", "for", "while", "break", "continue", "try", "catch", "finally", "throw", "case", "switch",
+  "default", "import", "export", "function", "class", "async", "await", "type", "interface", "enum",
+  "public", "private", "protected", "static", "readonly", "from", "as", "in", "of", "do", "end", "def",
+  "string", "number", "boolean", "any", "unknown", "never", "object",
+]);
+
+export function isInformativeLine(line: string): boolean {
+  const t = line.trim();
+  if (t.length < 8) return false;
+  if (!/[A-Za-z0-9_぀-ヿ一-鿿]/.test(t)) return false; // 記号のみ
+  if (/["'`].{4,}["'`]/.test(t)) return true; // 長いリテラルを含む
+  // 予約語だけで構成される定型行(`return null;` 等)は固有の情報を持たない
+  const idents = (t.match(/[A-Za-z_][A-Za-z0-9_]{2,}/g) ?? []).filter((w) => !KEYWORDS.has(w));
+  if (idents.length >= 2) return true;
+  return t.length >= 40 && idents.length >= 1;
+}
+
+/** 多重度を保った積(Set比較だと同じ行の複数出現を1回の一致でfull扱いしてしまう) */
+function multisetIntersect(target: string[], source: string[]): string[] {
+  const remaining = new Map<string, number>();
+  for (const l of source) remaining.set(l, (remaining.get(l) ?? 0) + 1);
+  const out: string[] = [];
+  for (const l of target) {
+    const c = remaining.get(l) ?? 0;
+    if (c > 0) {
+      remaining.set(l, c - 1);
+      out.push(l);
+    }
+  }
+  return out;
+}
+
+const OVERLAP_NOTE =
+  "このイベントの差分に、hunkと同じ文字列の変更行が含まれることのみを示す。帰属の十分条件ではない" +
+  "(頻出行の偶然一致・formatterの削除再追加・別主体による同一文字列の再追加があり得る)";
 
 /**
  * 帰属判定が実際に使っている機械的証拠を組み立てる(REQ-301/302)。
@@ -168,16 +217,24 @@ export function attributionBasis(
       event_diff: "(スナップショットが残っていないため、このイベントの差分を復元できません)",
       introduced_lines: [],
       removed_lines: [],
+      informative_matches: 0,
       overlap: "unknown",
+      overlap_note: OVERLAP_NOTE,
     };
   }
   const evHunks = gitNoIndexHunks(pre, post);
-  const evAdded = new Set(evHunks.flatMap((x) => x.addedLines));
-  const evRemoved = new Set(evHunks.flatMap((x) => x.removedLines));
-  const introduced = hunk.addedLines.filter((l) => evAdded.has(l));
-  const removed = hunk.removedLines.filter((l) => evRemoved.has(l));
+  // 符号付き(追加は追加どうし・削除は削除どうし)かつ多重度を保って突き合わせる(REQ-309)
+  const introduced = multisetIntersect(
+    hunk.addedLines,
+    evHunks.flatMap((x) => x.addedLines),
+  );
+  const removed = multisetIntersect(
+    hunk.removedLines,
+    evHunks.flatMap((x) => x.removedLines),
+  );
   const changedTotal = hunk.addedLines.length + hunk.removedLines.length;
   const matched = introduced.length + removed.length;
+  const informativeMatches = [...introduced, ...removed].filter(isInformativeLine).length;
   const overlap: AttributionBasis["overlap"] =
     changedTotal === 0 ? "unknown" : matched === 0 ? "none" : matched >= changedTotal ? "full" : "partial";
 
@@ -198,7 +255,9 @@ export function attributionBasis(
         : diffLines.slice(0, EVENT_DIFF_MAX_LINES).join("\n") + (truncated ? "\n…(以下省略)" : ""),
     introduced_lines: introduced,
     removed_lines: removed,
+    informative_matches: informativeMatches,
     overlap,
+    overlap_note: OVERLAP_NOTE,
   };
 }
 

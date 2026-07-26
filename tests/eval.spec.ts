@@ -4,9 +4,10 @@ import path from "node:path";
 import os from "node:os";
 import { afterEach, describe, expect, it } from "vitest";
 import { ProvenError } from "../src/shared/errors.js";
-import { buildCasePack } from "../src/eval/cases.js";
+import { attributionBasis, buildCasePack, isInformativeLine } from "../src/eval/cases.js";
 import { reportEval, submitJudgments } from "../src/eval/judgments.js";
 import { openDb, rebuild } from "../src/store/projections.js";
+import { putObject } from "../src/store/objects.js";
 import { runIngest } from "../src/ingest/ingest.js";
 import { capturedEdit, cleanup, initProven, makeRepo, manualEdit, writeTranscript, type Fixture } from "./helpers.js";
 
@@ -196,6 +197,77 @@ describe("帰属の機械的証拠(REQ-301〜303)", () => {
     expect(rubric).toContain("attribution_basis");
     expect(rubric).toContain("引用が無いこと自体はunsureの理由になりません");
   });
+});
+
+describe("機械的証拠の過剰断定を防ぐ(REQ-308/309)", () => {
+  /** 与えた内容でpre/postのblobを作り、attributionBasisへ渡せる形にする */
+  function ev(pre: string, post: string): { pre_blob_hash: string; result_blob_hash: string } {
+    return {
+      pre_blob_hash: putObject(fx.ws, Buffer.from(pre)).hash,
+      result_blob_hash: putObject(fx.ws, Buffer.from(post)).hash,
+    };
+  }
+
+  it("多重度を保つ: イベントが1回しか追加していない行を、hunkの2回分の一致にしない", () => {
+    fx = makeRepo({ "a.ts": "x\n" });
+    initProven(fx);
+    const line = "const veryDistinctIdentifier = computeSomething();";
+    const basis = attributionBasis(fx.ws, ev("base\n", `base\n${line}\n`), {
+      addedLines: [line, line], // hunk側は2回追加
+      removedLines: [],
+    });
+    expect(basis.introduced_lines).toEqual([line]); // 1回だけ一致
+    expect(basis.overlap).toBe("partial"); // fullにしない
+  });
+
+  it("符号を区別する: イベントが削除した行を、hunkの追加行の一致としない", () => {
+    fx = makeRepo({ "a.ts": "x\n" });
+    initProven(fx);
+    const line = "const veryDistinctIdentifier = computeSomething();";
+    const basis = attributionBasis(fx.ws, ev(`base\n${line}\n`, "base\n"), {
+      addedLines: [line],
+      removedLines: [],
+    });
+    expect(basis.introduced_lines).toEqual([]);
+    expect(basis.overlap).toBe("none");
+  });
+
+  it("定型行だけの一致は情報量ゼロとして数える(単独では証拠にしない)", () => {
+    fx = makeRepo({ "a.ts": "x\n" });
+    initProven(fx);
+    const basis = attributionBasis(fx.ws, ev("base\n", "base\n}\n"), { addedLines: ["}"], removedLines: [] });
+    expect(basis.introduced_lines).toEqual(["}"]);
+    expect(basis.informative_matches).toBe(0); // overlapは付くが証拠強度はゼロ
+  });
+
+  it("isInformativeLine: 定型行は非情報的、固有識別子やリテラルを含む行は情報的", () => {
+    for (const weak of ["}", "  );", "return null;", "", "   ", "else {"]) {
+      expect(isInformativeLine(weak)).toBe(false);
+    }
+    for (const strong of [
+      "const veryDistinctIdentifier = computeSomething();",
+      'throw new ProvenError("input", "指定のハーネスは未対応です");',
+      "export function attributionBasis(ws, ev, hunk) {",
+    ]) {
+      expect(isInformativeLine(strong)).toBe(true);
+    }
+  });
+
+  it("overlapに意味の限定注記が付き、rubricも十分条件と説明しない", () => {
+    fx = makeRepo({ "a.ts": "x\n" });
+    initProven(fx);
+    const basis = attributionBasis(fx.ws, ev("base\n", "base\nfoo\n"), { addedLines: ["foo"], removedLines: [] });
+    expect(basis.overlap_note).toContain("帰属の十分条件ではない");
+    scenarioRubric();
+  });
+
+  function scenarioRubric(): void {
+    cleanup(fx);
+    scenario();
+    const rubric = buildCasePack(fx.ws, "lineage", 5).rubric.join("\n");
+    expect(rubric).toContain("帰属の十分条件ではありません");
+    expect(rubric).not.toContain("実際に作ったことを意味します");
+  }
 });
 
 describe("submit/report(検証の格付け=設計原則2)", () => {
