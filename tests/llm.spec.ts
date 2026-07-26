@@ -257,3 +257,15 @@ describe("設定の既定(REQ-810)", () => {
     expect(fs.readFileSync(path.join(fx.dir, ".proven/config.yaml"), "utf8")).toContain("enabled: false");
   });
 });
+
+describe("プロバイダ出力のパース(REQ-818)", () => {
+  it("```jsonフェンスや前後の説明文があってもJSONを取り出せる", async () => {
+    const { parseJsonLoose } = await import("../src/llm/provider.js");
+    expect(parseJsonLoose('{"value":"あり"}')).toEqual({ value: "あり" });
+    expect(parseJsonLoose('```json\n{"value":"支持"}\n```')).toEqual({ value: "支持" });
+    expect(parseJsonLoose('以下が結果です。\n{"value":"判定不能"}\nご確認ください。')).toEqual({
+      value: "判定不能",
+    });
+    expect(parseJsonLoose("JSONではない出力")).toBeNull();
+  });
+});

@@ -11,7 +11,7 @@ import { fileContent, manifestMap, resolveRevision } from "../ingest/revision.js
 import { gitNoIndexHunks } from "../ingest/diff.js";
 import { searchSpec, specParagraph } from "../spec/index.js";
 import { recentUserUtterances } from "../claims/heuristics.js";
-import { anthropicProvider, claudeCliProvider, hasCredentials, type LlmProvider } from "./provider.js";
+import { anthropicProvider, codexCliProvider, hasCredentials, type LlmProvider } from "./provider.js";
 import { budgetExhausted, judge, newBudget, type JudgeInput } from "./judge.js";
 
 export interface LlmRunSummary {
@@ -79,14 +79,14 @@ export async function runLlmJudge(
     warnings.push("LLM送信はOFFです(`proven config llm.enabled true` で有効化)");
     return empty;
   }
-  const useCli = cfg.llm.provider === "claude-cli";
-  const provider = opts.provider ?? (useCli ? claudeCliProvider() : anthropicProvider());
+  const useCli = cfg.llm.provider === "codex-cli";
+  const provider = opts.provider ?? (useCli ? codexCliProvider() : anthropicProvider());
   // 認証が無い場合はエラーにせず無効として続行する(REQ-815)。
-  // claude-cli はCLI側が認証を持つため、APIキーの有無は問わない
+  // codex-cli はCLI側が認証を持つため、APIキーの有無は問わない
   if (!opts.provider && !useCli && !hasCredentials(opts.env)) {
     warnings.push(
       "認証情報が見つからないためLLM層を無効にしました(ANTHROPIC_API_KEY を設定するか、" +
-        "`proven config llm.provider claude-cli` でローカルのclaude CLIを使ってください)",
+        "`proven config llm.provider codex-cli` などローカルCLIを使ってください)",
     );
     return empty;
   }

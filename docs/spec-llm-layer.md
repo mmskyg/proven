@@ -99,9 +99,42 @@ REQ-816: API呼び出しの失敗（レート制限・ネットワーク断・�
 5. LLM由来claimに method/model/prompt_digest が記録されることをテストで固定
 6. 送信ペイロードがマスキング済みで、evidence隔離されていることをテストで固定
 
-REQ-817: プロバイダとして**ローカルの `claude` CLI** も選べるようにする（`llm.provider: claude-cli`）。
-APIキーを持たない利用者でも、既に認証済みのエージェントCLIでLLM層を動かせるようにするため。
-費用はCLIが返す `total_cost_usd` を使う（トークン数からの見積もりより正確）。
+REQ-817: プロバイダとして**ローカルの Codex CLI**（`llm.provider: codex-cli`）も選べるようにする。
+APIキーを持たない利用者向けの選択肢。
+
+### 規約の確認（2026-07-27に一次情報を確認）
+
+**Anthropic 消費者向け利用規約**（https://www.anthropic.com/legal/consumer-terms）:
+
+> Except when you are accessing our Services via an Anthropic API Key or where we otherwise explicitly
+> permit it, to access the Services through automated or non-human means, whether through a bot, script,
+> or otherwise.
+
+自動化・スクリプト経由のアクセスは、**APIキー経由**または**明示的に許諾された場合**を除いて禁止される。
+また「本サービスと競合する製品の開発」「本サービスの再販」も禁止されている。
+なお Claude Code の公式ドキュメントは `claude -p` をスクリプト・CIで使う例を挙げており、
+Claude Code 自体の非対話利用は許諾されていると読める。ただし本ツールの一機能のバックエンドとして
+サブスクリプションを使ってよいかは、この読みだけでは確定できない。
+
+**OpenAI Codex CLI ドキュメント**（https://learn.chatgpt.com/docs/codex/cli）:
+
+> Use Codex interactively or call `codex exec` from repeatable workflows and pipelines.
+
+`codex exec` を**繰り返し実行するワークフロー・パイプラインから呼ぶこと**が公式に案内されており、
+ChatGPTアカウントでのサインインが標準の認証方法として示されている。
+
+**結論**: 曖昧さの小さい順に、①公式APIキー（既定）②Codex CLI の順とする。
+Anthropic のCLIをバックエンドに使う経路は**提供しない**（規約上の位置づけを断定できないため）。
+
+REQ-818: **既定プロバイダは公式APIキー方式（`anthropic`）とする。**
+CLI方式は明示的に設定した場合のみ有効とし、ドキュメントに次を明記する。
+
+> ローカルCLIを自動実行してこのツールの判定に使うことが、その契約（サブスクリプション）で
+> 許されるかは各サービスの利用規約によります。CLI方式を使う前に、ご自身の契約条件を確認してください。
+> 判断できない場合は、プログラム利用が明示的に許諾されている公式APIキー方式を使ってください。
+
+理由: プログラムから他社CLIを叩いて自社ツールの機能を実現することが規約上どう扱われるかは、
+本ツールが判断できる事柄ではない。既定を曖昧さのない方式に置き、CLI方式は利用者の明示的な選択にする。
 
 ## 8. 実装後のE2E結果（2026-07-27）
 

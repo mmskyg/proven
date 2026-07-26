@@ -14,7 +14,7 @@ export interface LlmResponse {
   parsed: Record<string, unknown> | null;
   usage: { inputTokens: number; outputTokens: number };
   model: string;
-  /** プロバイダが実費を返す場合(claude-cli)。あれば見積もりより優先する */
+  /** プロバイダが実費を返す場合。あれば見積もりより優先する */
   costUsdOverride?: number;
 }
 
@@ -98,43 +98,72 @@ export function anthropicProvider(): LlmProvider {
   };
 }
 
+/** ```json フェンス付きで返ることがあるので剥がしてからパースする */
+export function parseJsonLoose(text: string): Record<string, unknown> | null {
+  const fenced = /```(?:json)?\s*([\s\S]*?)```/.exec(text)?.[1];
+  const body = (fenced ?? text).trim();
+  try {
+    return JSON.parse(body) as Record<string, unknown>;
+  } catch {
+    // 前後に説明文が付く場合に備え、最初の { から最後の } までを試す
+    const s = body.indexOf("{");
+    const e = body.lastIndexOf("}");
+    if (s >= 0 && e > s) {
+      try {
+        return JSON.parse(body.slice(s, e + 1)) as Record<string, unknown>;
+      } catch {
+        return null;
+      }
+    }
+    return null;
+  }
+}
+
 /**
- * ローカルの `claude` CLI をプロバイダとして使う(REQ-814/817)。
- * APIキーを持たない利用者でも、既に認証済みのエージェントCLIでLLM層を動かせる。
- * 費用はCLIが返す total_cost_usd をそのまま使う(見積もりより正確)。
+ * ローカルの `codex` CLI をプロバイダとして使う(REQ-818)。
+ * 認証はCodex CLI側の設定に従う。サンドボックスは read-only で起動し、
+ * 判定のためにファイルを書き換えさせない。
  */
-export function claudeCliProvider(): LlmProvider {
+export function codexCliProvider(): LlmProvider {
   return {
-    name: "claude-cli",
+    name: "codex-cli",
     async complete(req: LlmRequest): Promise<LlmResponse | null> {
       try {
         const { execFile } = await import("node:child_process");
         const { promisify } = await import("node:util");
+        const os = await import("node:os");
+        const fs = await import("node:fs");
+        const path = await import("node:path");
         const run = promisify(execFile);
-        const instruction = `${req.user}\n\n出力はJSONのみ。スキーマ: ${JSON.stringify(req.schema)}`;
-        const { stdout } = await run(
-          "claude",
-          ["-p", instruction, "--output-format", "json", "--model", req.model, "--append-system-prompt", req.system],
-          { maxBuffer: 10 * 1024 * 1024, timeout: 180_000 },
-        );
-        const env = JSON.parse(stdout) as { result?: string; total_cost_usd?: number; is_error?: boolean };
-        if (env.is_error) return null;
-        const text = env.result ?? "";
-        // ```json フェンスが付くことがあるので剥がす
-        const body = /```(?:json)?\s*([\s\S]*?)```/.exec(text)?.[1] ?? text;
-        let parsed: Record<string, unknown> | null = null;
+        const dir = fs.mkdtempSync(path.join(os.tmpdir(), "proven-codex-"));
+        const out = path.join(dir, "last.txt");
+        const prompt = `${req.system}\n\n${req.user}\n\n出力はJSONのみ。スキーマ: ${JSON.stringify(req.schema)}`;
         try {
-          parsed = JSON.parse(body.trim()) as Record<string, unknown>;
-        } catch {
-          parsed = null;
+          await run(
+            "codex",
+            [
+              "exec",
+              "--sandbox",
+              "read-only",
+              "--skip-git-repo-check",
+              "-C",
+              dir,
+              "-m",
+              req.model,
+              // 短い構造化判定なので推論は浅くてよい(既定のままだと数分かかる)
+              "-c",
+              "model_reasoning_effort=low",
+              "-o",
+              out,
+              prompt,
+            ],
+            { maxBuffer: 10 * 1024 * 1024, timeout: 600_000 },
+          );
+          const text = fs.existsSync(out) ? fs.readFileSync(out, "utf8") : "";
+          return { parsed: parseJsonLoose(text), usage: { inputTokens: 0, outputTokens: 0 }, model: req.model };
+        } finally {
+          fs.rmSync(dir, { recursive: true, force: true });
         }
-        return {
-          parsed,
-          // 費用はCLI側の実測値を使うため、トークン数ではなくcostUsdOverrideで渡す
-          usage: { inputTokens: 0, outputTokens: 0 },
-          costUsdOverride: env.total_cost_usd,
-          model: req.model,
-        };
       } catch {
         return null;
       }

@@ -85,8 +85,13 @@ Node.js 20以上。SQLiteのネイティブモジュール(better-sqlite3)をビ
 - **LLM層**: 既定OFF。有効化すると `proven llm-judge` で第二段判定が動きます(ヒューリスティックが判定不能とした変更だけが対象)。
   断定には根拠となる句の引用を必須とし、引用のない断定は破棄します。confidenceは0.7が上限で、LLM由来のclaimは
   `method=llm` / モデル名 / プロンプトのdigest つきで記録され、常に未検証(AI仮説)扱いです。
-  `ask` の推測セクションは未実装です。プロバイダは Anthropic API のほか、APIキーが無い場合はローカルの `claude` CLI を使えます
-  (`proven config llm.provider claude-cli`)。**この層の精度は未計測です。**
+  `ask` の推測セクションは未実装です。**この層の精度は未計測です。**
+- **LLMプロバイダ**: 既定は公式APIキー方式(`anthropic`)です。Anthropicの消費者向け規約は、
+  自動化・スクリプト経由のアクセスを「APIキー経由、または明示的に許諾された場合」に限っているため、
+  **サブスクリプション認証のCLIをバックエンドに使う経路は提供していません**。
+  APIキーを持たない場合の選択肢として、`codex exec` をパイプラインから呼ぶことを公式に案内している
+  Codex CLI(`proven config llm.provider codex-cli`)を選べます。いずれの場合も、
+  ご自身の契約条件の確認は利用者側の責任です。
 - **Phase 2以降の全機能**: レビューTUI(`review`)、検証バッテリー(`verify`)、承認記録(`attest`)、ルール学習(`learn`)、文体lint(`docstyle`)、メトリクス(`report`)は未着手です。
 - `ingest` の `--resume`、LLM予算オプション(`--max-llm-calls` / `--budget`)、lineageの時間予算による中断は未実装です。編集履歴が多いファイルで処理時間が伸びる可能性があります。
 - triageの「被参照数」加点は常に無効です(実装が空)。加点表の他の項目は動作します。
