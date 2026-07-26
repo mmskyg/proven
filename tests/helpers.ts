@@ -86,8 +86,19 @@ export function manualEdit(fx: Fixture, relFile: string, newContent: string): vo
   fs.writeFileSync(abs, newContent);
 }
 
-const TSX = path.join(process.cwd(), "node_modules", ".bin", "tsx");
-const MAIN = path.join(process.cwd(), "src", "cli", "main.ts");
+export const TSX = path.join(process.cwd(), "node_modules", ".bin", "tsx");
+export const MAIN = path.join(process.cwd(), "src", "cli", "main.ts");
+
+/**
+ * PATH上に `proven` の実体を用意する(hookコマンドをそのまま実行する検証用)。
+ * 戻り値をPATHの先頭に足すと、登録済みhookコマンド文字列を改変せずに実行できる。
+ */
+export function provenShimDir(): string {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "proven-shim-"));
+  const shim = path.join(dir, "proven");
+  fs.writeFileSync(shim, `#!/bin/sh\nexec "${TSX}" "${MAIN}" "$@"\n`, { mode: 0o755 });
+  return dir;
+}
 
 export interface CliResult {
   code: number;

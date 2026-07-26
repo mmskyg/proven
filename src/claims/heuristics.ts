@@ -12,6 +12,7 @@ import { appendEvent } from "../store/events.js";
 import { applyEvent } from "../store/projections.js";
 import type { Workspace } from "../store/paths.js";
 import { searchSpec, tokenize } from "../spec/index.js";
+import { adapterById, claudeCodeAdapter } from "../agents/index.js";
 import type { RawHunk } from "../ingest/diff.js";
 import type { HunkAttribution } from "../ingest/lineage.js";
 
@@ -25,7 +26,7 @@ interface ClaimInput {
   file: string;
   hunk: RawHunk;
   attribution: HunkAttribution;
-  events: { operationId: string; sessionRef: string; transcriptLine: number | null }[];
+  events: { operationId: string; sessionRef: string; transcriptLine: number | null; agent?: string }[];
   gapCause: { whitespaceOnly: boolean } | null;
 }
 
@@ -35,33 +36,20 @@ interface UserUtterance {
   path: string;
 }
 
-/** transcript(JSONL)からtranscript_line以前の直近user発話を最大3件取得 */
-export function recentUserUtterances(sessionRef: string, beforeLine: number | null, max = 3): UserUtterance[] {
-  if (!sessionRef || !fs.existsSync(sessionRef)) return [];
-  const lines = fs.readFileSync(sessionRef, "utf8").split("\n");
-  const out: UserUtterance[] = [];
-  const limit = beforeLine === null ? lines.length : Math.min(beforeLine, lines.length);
-  for (let i = limit - 1; i >= 0 && out.length < max; i--) {
-    const line = lines[i];
-    if (!line) continue;
-    try {
-      const obj = JSON.parse(line);
-      const role = obj?.message?.role ?? obj?.role ?? obj?.type;
-      if (role === "user") {
-        const content = obj?.message?.content ?? obj?.content ?? "";
-        const text =
-          typeof content === "string"
-            ? content
-            : Array.isArray(content)
-              ? content.map((c: { text?: string }) => c?.text ?? "").join(" ")
-              : "";
-        if (text.trim()) out.push({ text, line: i + 1, path: sessionRef });
-      }
-    } catch {
-      continue;
-    }
-  }
-  return out;
+/**
+ * transcriptからtranscript_line以前の直近user発話を最大3件取得。
+ * 形式はハーネスごとに違う(Claude CodeはJSONL / codexはrollout)ため、
+ * アダプタのreadUtterancesへ委譲する。未対応ハーネスは空配列(=判定不能へ倒す)。
+ */
+export function recentUserUtterances(
+  sessionRef: string,
+  beforeLine: number | null,
+  max = 3,
+  agent = "claude-code",
+): UserUtterance[] {
+  const adapter = adapterById(agent) ?? claudeCodeAdapter;
+  if (!adapter.readUtterances) return [];
+  return adapter.readUtterances(sessionRef, beforeLine, max);
 }
 
 function hunkIdentifiers(file: string, hunk: RawHunk): string[] {
@@ -109,7 +97,7 @@ export function emitClaimsForHunk(ws: Workspace, db: Sqlite.Database, input: Cla
     if (ev.transcriptLine === null || !fs.existsSync(ev.sessionRef)) {
       instructedReason = "transcriptが読めない(context_status=transcript_broken)";
     } else {
-      const utterances = recentUserUtterances(ev.sessionRef, ev.transcriptLine, 3);
+      const utterances = recentUserUtterances(ev.sessionRef, ev.transcriptLine, 3, ev.agent);
       if (utterances.length === 0) {
         instructedReason = "直近のuser発話が見つからない";
       } else {

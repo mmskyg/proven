@@ -146,7 +146,7 @@ export function runIngest(ws: Workspace, opts: { range?: string } = {}): IngestS
       // completed編集イベント(このファイル)
       const evRows = db
         .prepare(
-          `SELECT operation_id, pre_blob_hash, result_blob_hash, session_ref, transcript_line
+          `SELECT operation_id, pre_blob_hash, result_blob_hash, session_ref, transcript_line, agent
            FROM edit_events WHERE file=? AND status='completed' ORDER BY ts_pre ASC, operation_id ASC`,
         )
         .all(file) as {
@@ -155,13 +155,28 @@ export function runIngest(ws: Workspace, opts: { range?: string } = {}): IngestS
         result_blob_hash: string | null;
         session_ref: string;
         transcript_line: number | null;
+        agent: string | null;
       }[];
-      const events: { operationId: string; pre: string; post: string; sessionRef: string; transcriptLine: number | null }[] = [];
+      const events: {
+        operationId: string;
+        pre: string;
+        post: string;
+        sessionRef: string;
+        transcriptLine: number | null;
+        agent: string;
+      }[] = [];
       for (const r of evRows) {
         const pre = r.pre_blob_hash ? getObject(ws, r.pre_blob_hash)?.toString("utf8") ?? null : "";
         const post = r.result_blob_hash ? getObject(ws, r.result_blob_hash)?.toString("utf8") ?? null : "";
         if (pre === null || post === null) continue; // スナップショット欠落は連鎖対象外
-        events.push({ operationId: r.operation_id, pre, post, sessionRef: r.session_ref, transcriptLine: r.transcript_line });
+        events.push({
+          operationId: r.operation_id,
+          pre,
+          post,
+          sessionRef: r.session_ref,
+          transcriptLine: r.transcript_line,
+          agent: r.agent ?? "claude-code",
+        });
       }
       const lineage = computeFileLineage(oldContent ?? "", newContent ?? "", events);
 

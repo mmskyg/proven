@@ -13,7 +13,8 @@ const ConfigSchema = z.object({
   agents: z
     .array(
       z.object({
-        type: z.literal("claude-code"),
+        // REQ-227: 単一ハーネス固定からenumへ。既存の `agents: []` はそのまま読める
+        type: z.enum(["claude-code", "codex", "opencode", "generic"]),
         transcripts: z.string().default(""),
         hooks_autocapture: z.boolean().default(true),
       }),

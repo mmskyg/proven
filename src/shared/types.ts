@@ -12,20 +12,31 @@ export interface EventEnvelope<T extends string = string, P = unknown> {
 
 export type EditTool = "Edit" | "Write" | "MultiEdit" | "NotebookEdit";
 
+/** 検出方法(REQ-206)。旧イベントには存在しないためoptional */
+export interface AgentDetectionRecord {
+  method: "declared" | "inferred" | "unknown";
+  signals: string[];
+  confidence: number | null;
+}
+
 export interface EditPre {
   operation_id: string;
-  agent: "claude-code";
+  /** ハーネス識別子(REQ-227でenum化)。旧イベントは "claude-code" 固定 */
+  agent: string;
   session_ref: string;
   file: string; // repo-relative
   pre_blob_hash: string | null;
-  tool: EditTool;
+  tool: EditTool | string;
   conversation_ref: { transcript_line: number } | null;
+  agent_detection?: AgentDetectionRecord;
 }
 
 export interface EditPost {
   operation_id: string;
   result_blob_hash: string | null;
   tool_status: "success" | "failure";
+  /** 1操作N ファイル(REQ-224)。旧イベントは未設定=その操作の全ファイル行を更新 */
+  file?: string;
 }
 
 export interface GenerationStarted {

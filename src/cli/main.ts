@@ -7,6 +7,7 @@ import { loadConfig, saveConfig } from "../shared/config.js";
 import { requireInitialized, workspace, git } from "../store/paths.js";
 import { runInit } from "./init.js";
 import { runCapture, type HookInput } from "../capture/capture.js";
+import { resolveAgent } from "../agents/index.js";
 import { runIngest } from "../ingest/ingest.js";
 import { renderTriageText, runTriage, writeTriageMd } from "../triage/triage.js";
 import { confirmOrigin, recordFinding, renderAsk, runAsk } from "../ask/ask.js";
@@ -73,11 +74,18 @@ program
   .command("init")
   .description("プロジェクト初期化(F-01)")
   .option("--yes", "非対話で既定値を使用", false)
-  .action((opts: { yes: boolean }) => {
+  .option("--agent <ids>", "登録するハーネスをカンマ区切りで明示(既定: 検出した全て)")
+  .action((opts: { yes: boolean; agent?: string }) => {
     const ctx: OutputCtx = { json: false, warnings: [] };
     try {
       const ws = workspace(process.cwd());
-      const r = runInit(ws, { yes: opts.yes, isTTY: process.stdout.isTTY ?? false });
+      const agents = opts.agent
+        ? opts.agent
+            .split(",")
+            .map((s) => s.trim())
+            .filter(Boolean)
+        : undefined;
+      const r = runInit(ws, { yes: opts.yes, isTTY: process.stdout.isTTY ?? false, agents });
       emitResult(ctx, "init", "ok", r, [
         r.created ? ".proven/ を作成しました" : ".proven/ は既に存在します(再初期化)",
         ...r.messages,
@@ -91,15 +99,24 @@ program
   .command("capture")
   .description("hookからの編集イベント捕捉(F-02a)。常にexit 0")
   .requiredOption("--phase <phase>", "pre|post")
-  .action((opts: { phase: string }) => {
+  .option("--agent <id>", "呼び出し元ハーネスの自己申告: claude-code|codex|opencode|generic")
+  .action((opts: { phase: string; agent?: string }) => {
     // 絶対原則: 開発を止めない。どんな失敗でもexit 0
     try {
       const stdin = fs.readFileSync(0, "utf8");
       const input = JSON.parse(stdin) as HookInput;
+      const phase = opts.phase === "post" ? "post" : "pre";
       // リポジトリ解決は編集ファイル基準(ネストしたgitリポジトリでcwd基準だと
-      // 外側リポジトリへ誤帰属するため)。解決不能時のみcwdへフォールバック
-      const rawFile = (input.tool_input?.file_path ?? input.tool_input?.notebook_path) as string | undefined;
+      // 外側リポジトリへ誤帰属するため)。解決不能時のみcwdへフォールバック。
+      // ファイルの在処はハーネスごとに異なる(codexはパッチ本文中)のでアダプタに解決させる
       const cwd = input.cwd ?? process.cwd();
+      let rawFile: string | undefined;
+      try {
+        const resolved = resolveAgent({ declared: opts.agent ?? null, raw: input as Record<string, unknown> });
+        rawFile = resolved.adapter.normalize(input as Record<string, unknown>, phase)?.files[0];
+      } catch {
+        /* 解決不能はcwdへフォールバック */
+      }
       let ws;
       try {
         const abs = rawFile ? (path.isAbsolute(rawFile) ? rawFile : path.join(cwd, rawFile)) : cwd;
@@ -108,7 +125,7 @@ program
         ws = workspace(cwd);
       }
       requireInitialized(ws);
-      runCapture(ws, opts.phase === "post" ? "post" : "pre", input);
+      runCapture(ws, phase, input, { declaredAgent: opts.agent ?? null });
     } catch {
       /* logged inside; never block */
     }

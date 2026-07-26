@@ -8,8 +8,8 @@ AI駆動開発でのコードレビューを支援するCLIです。AIエージ�
 ## 何が起きるか
 
 ```
-proven init            # .proven/作成 + Claude Code hooks登録(以後は自動記録)
-# …Claude Codeで普通に開発…
+proven init            # .proven/作成 + 検出したハーネスにhook/プラグイン登録(以後は自動記録)
+# …Claude Code / Codex / OpenCode で普通に開発…
 proven ingest          # diffと編集イベントを結合して来歴を構築
 proven triage          # 精読すべき順に提示(なぜその順位かの内訳つき)
 proven ask src/x.ts:42 # 「なぜこの変更?」を記録に聞く
@@ -53,6 +53,18 @@ proven init --yes                                # 対象リポジトリで実�
 
 Node.js 20以上。SQLiteのネイティブモジュール(better-sqlite3)をビルドします。
 
+`init` は環境を見てハーネスを検出し、見つかったものに登録します(`--agent codex,opencode` で明示指定も可)。
+実行時にどのハーネスかを環境変数から推測することはしません。登録するコマンドに `--agent` を埋め込み、
+**呼び出し側が名乗る**方式です(Claude Code のセッションから Codex を起動するような入れ子で誤判定しないため)。
+名乗りが無い場合だけ推定し、その場合は推定であることと根拠を記録に残します。
+
+| ハーネス | 登録先 | 編集前状態 | 1操作あたり | 会話履歴 |
+|---|---|---|---|---|
+| Claude Code | `.claude/settings.json` | hook | 1ファイル | transcript JSONL |
+| Codex | `.codex/hooks.json`(要 `/hooks` trust) | hook | **複数ファイル**(apply_patch) | rollout JSONL |
+| OpenCode | `.opencode/plugin/proven.js` | プラグイン | 複数ファイル | 未対応(SDK側) |
+| generic | 自前 | 呼び出し側次第 | 複数ファイル | なし |
+
 ## 制限事項(重要)
 
 **このツールはPhase 1(MVP)であり、中核仮説の検証がまだ終わっていません。**
@@ -77,13 +89,15 @@ Node.js 20以上。SQLiteのネイティブモジュール(better-sqlite3)をビ
 
 - **hook外の変更は捕捉できません。** 手編集、formatter、シェル経由の書き換えはuncaptured / brokenになります。これは仕様であり、推定で埋めません。実運用でuncapturedが何割になるかは未計測です。
 - **改ざん耐性はありません。** 承認記録は追記専用のチェーンハッシュですが、ローカルファイルである以上「本人の作業記録」であり監査証跡ではありません。検出できるのは後続行が存在する行の改変だけです。
-- **Claude Code専用**です。他のAIエージェントのログ形式には未対応です。
+- **ハーネスごとに捕捉品質が違います。** Claude Code / Codex / OpenCode に対応していますが、取れる情報は同じではありません(下記)。未対応ハーネスは `--agent generic` の入力契約で自前連携できます。
+- **Codexのhookは信頼付与が必要です。** `proven init` が `.codex/hooks.json` を書いても、Codex CLI の `/hooks` で trust するまで実行されません。
 - renameは追跡せず、削除+追加として扱います。
 - 性能は実測していません。captureのp95 50ms以内などは設計上の想定値です。
 
 ### 検証済みのこと
 
-- 自動テスト114件(vitest)が通ります。イベントストアからのprojection完全再構築、事実とclaimの峻別、プロンプトインジェクションの隔離、hookが開発をブロックしないこと、来歴チェーンの改ざん検知などを含みます。
+- 自動テスト130件(vitest)が通ります。イベントストアからのprojection完全再構築、事実とclaimの峻別、プロンプトインジェクションの隔離、hookが開発をブロックしないこと、来歴チェーンの改ざん検知などを含みます。
+- Codex / OpenCode 対応は実機で確認しました。Codexは1回の `apply_patch` で2ファイルを変更したケースが同一操作IDで記録され、rolloutから当時のユーザー発話を引いて「明示指示あり」まで到達しています。OpenCodeはプラグイン経由でpre/postが対で記録されます。ただし**どちらも精度は未計測**です(上記のとおり)。
 - Proven自身のリポジトリでのドッグフーディングで、指示されていないAIの自律修正をunsolicited候補として検出し、実transcriptから当時のAI説明を引用できることを確認しました。
 - 同じドッグフーディングで実バグを2件見つけて直しました(ネストしたリポジトリでの捕捉先の誤り、日本語の指示とコンテンツが照合できない問題)。いずれも回帰テストつきです。
 
@@ -101,7 +115,7 @@ Node.js 20以上。SQLiteのネイティブモジュール(better-sqlite3)をビ
 ## テスト
 
 ```bash
-npm test        # vitest 114件
+npm test        # vitest 130件
 npm run typecheck
 ```
 

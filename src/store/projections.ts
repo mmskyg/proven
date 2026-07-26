@@ -21,10 +21,12 @@ import { dbPath } from "./paths.js";
 export const DDL = `
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
 CREATE TABLE IF NOT EXISTS edit_events (
-  operation_id TEXT PRIMARY KEY, file TEXT, agent TEXT, session_ref TEXT,
+  operation_id TEXT, file TEXT, agent TEXT, session_ref TEXT,
   pre_blob_hash TEXT, result_blob_hash TEXT,
   status TEXT CHECK(status IN ('completed','failed','aborted','pending')),
-  ts_pre TEXT, ts_post TEXT, transcript_line INTEGER);
+  ts_pre TEXT, ts_post TEXT, transcript_line INTEGER,
+  agent_detection TEXT,
+  PRIMARY KEY(operation_id, file));
 CREATE INDEX IF NOT EXISTS idx_edit_file ON edit_events(file, ts_pre);
 CREATE TABLE IF NOT EXISTS hunks (
   hunk_instance_id TEXT PRIMARY KEY, ingest_job_id TEXT, file TEXT,
@@ -56,11 +58,39 @@ CREATE TABLE IF NOT EXISTS eval_judgments (judgment_id TEXT PRIMARY KEY, kind TE
 CREATE INDEX IF NOT EXISTS idx_eval_case ON eval_judgments(kind, case_id, judge);
 `;
 
+/**
+ * edit_events を旧スキーマ(PRIMARY KEY=operation_id / agent_detection列なし)から
+ * 新スキーマ(PRIMARY KEY=(operation_id,file))へ移行する(REQ-223)。
+ * projectionは派生物だが、既存行を捨てずに移送する(rebuild前でも読めるようにするため)。
+ */
+function migrateEditEvents(db: Sqlite.Database): void {
+  const cols = db.prepare("PRAGMA table_info(edit_events)").all() as { name: string }[];
+  if (cols.length === 0 || cols.some((c) => c.name === "agent_detection")) return;
+  db.exec(`
+    DROP INDEX IF EXISTS idx_edit_file;
+    ALTER TABLE edit_events RENAME TO edit_events_old;
+    CREATE TABLE edit_events (
+      operation_id TEXT, file TEXT, agent TEXT, session_ref TEXT,
+      pre_blob_hash TEXT, result_blob_hash TEXT,
+      status TEXT CHECK(status IN ('completed','failed','aborted','pending')),
+      ts_pre TEXT, ts_post TEXT, transcript_line INTEGER,
+      agent_detection TEXT,
+      PRIMARY KEY(operation_id, file));
+    INSERT INTO edit_events(operation_id, file, agent, session_ref, pre_blob_hash, result_blob_hash,
+                            status, ts_pre, ts_post, transcript_line)
+      SELECT operation_id, file, agent, session_ref, pre_blob_hash, result_blob_hash,
+             status, ts_pre, ts_post, transcript_line FROM edit_events_old;
+    DROP TABLE edit_events_old;
+    CREATE INDEX IF NOT EXISTS idx_edit_file ON edit_events(file, ts_pre);
+  `);
+}
+
 export function openDb(ws: Workspace): Sqlite.Database {
   const db = new Database(dbPath(ws));
   db.pragma("journal_mode = WAL");
   try {
     db.exec(DDL);
+    migrateEditEvents(db);
     db.exec("CREATE VIRTUAL TABLE IF NOT EXISTS spec_fts USING fts5(req_id, heading, body, file, section)");
   } catch (e) {
     db.close();
@@ -87,28 +117,44 @@ export function applyEvent(db: Sqlite.Database, env: EventEnvelope): void {
     case "edit_pre": {
       const p = env.payload as EditPre;
       db.prepare(
-        `INSERT INTO edit_events(operation_id, file, agent, session_ref, pre_blob_hash, status, ts_pre, transcript_line)
-         VALUES (?,?,?,?,?, 'pending', ?, ?)
-         ON CONFLICT(operation_id) DO NOTHING`,
-      ).run(p.operation_id, p.file, p.agent, p.session_ref, p.pre_blob_hash, env.ts, p.conversation_ref?.transcript_line ?? null);
+        `INSERT INTO edit_events(operation_id, file, agent, session_ref, pre_blob_hash, status, ts_pre, transcript_line, agent_detection)
+         VALUES (?,?,?,?,?, 'pending', ?, ?, ?)
+         ON CONFLICT(operation_id, file) DO NOTHING`,
+      ).run(
+        p.operation_id,
+        p.file,
+        p.agent,
+        p.session_ref,
+        p.pre_blob_hash,
+        env.ts,
+        p.conversation_ref?.transcript_line ?? null,
+        p.agent_detection ? JSON.stringify(p.agent_detection) : null,
+      );
       break;
     }
     case "edit_post": {
       const p = env.payload as EditPost;
       // 孤児post(preなし)はprojection行を作らない(v0.3)。再適用(既にcompleted)はno-op
-      const row = db.prepare("SELECT status FROM edit_events WHERE operation_id=?").get(p.operation_id) as
-        | { status: string }
-        | undefined;
-      if (!row) {
+      // 1操作N ファイル(REQ-224): fileが付いていればその行のみ、無ければ操作配下の全pending行を更新
+      const rows = (
+        p.file
+          ? db.prepare("SELECT file, status FROM edit_events WHERE operation_id=? AND file=?").all(p.operation_id, p.file)
+          : db.prepare("SELECT file, status FROM edit_events WHERE operation_id=?").all(p.operation_id)
+      ) as { file: string; status: string }[];
+      if (rows.length === 0) {
         db.prepare(
           `INSERT INTO meta(key,value) VALUES('orphan_posts','1')
            ON CONFLICT(key) DO UPDATE SET value=CAST(CAST(value AS INTEGER)+1 AS TEXT)`,
         ).run();
-      } else if (row.status === "pending") {
-        db.prepare(
+      } else {
+        const upd = db.prepare(
           `UPDATE edit_events SET result_blob_hash=?, ts_post=?, status=CASE WHEN ?='success' THEN 'completed' ELSE 'failed' END
-           WHERE operation_id=?`,
-        ).run(p.result_blob_hash, env.ts, p.tool_status, p.operation_id);
+           WHERE operation_id=? AND file=?`,
+        );
+        for (const row of rows) {
+          if (row.status !== "pending") continue;
+          upd.run(p.result_blob_hash, env.ts, p.tool_status, p.operation_id, row.file);
+        }
       }
       break;
     }

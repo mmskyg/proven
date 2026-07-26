@@ -1,3 +1,5 @@
 node_modules/
 .proven/
 .claude/
+.codex/
+.opencode/

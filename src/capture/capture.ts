@@ -1,13 +1,11 @@
 import fs from "node:fs";
 import path from "node:path";
 import { loadConfig, matchAnyGlob } from "../shared/config.js";
-import { sha256 } from "../shared/hash.js";
-import type { EditPost, EditPre, EditTool } from "../shared/types.js";
+import type { AgentDetectionRecord, EditPost, EditPre } from "../shared/types.js";
 import { appendEvent, readEvents } from "../store/events.js";
 import { putObject } from "../store/objects.js";
 import { logsDir, type Workspace } from "../store/paths.js";
-
-const TARGET_TOOLS = new Set(["Edit", "Write", "MultiEdit", "NotebookEdit"]);
+import { resolveAgent, type NormalizedCapture } from "../agents/index.js";
 
 export interface HookInput {
   session_id?: string;
@@ -18,6 +16,7 @@ export interface HookInput {
   tool_input?: { file_path?: string; notebook_path?: string; [k: string]: unknown };
   tool_use_id?: string;
   tool_response?: unknown;
+  [k: string]: unknown;
 }
 
 function logCaptureError(ws: Workspace, msg: string): void {
@@ -63,94 +62,135 @@ export function resolveCapturePath(
   return { abs, rel };
 }
 
-function transcriptTailLine(transcriptPath: string | undefined): number | null {
-  if (!transcriptPath || !fs.existsSync(transcriptPath)) return null;
-  const text = fs.readFileSync(transcriptPath, "utf8");
+/** transcriptがファイルとして読める場合のみ行数を返す(sdk/none形式はnull) */
+function transcriptTailLine(sessionRef: string): number | null {
+  if (!sessionRef || !fs.existsSync(sessionRef)) return null;
+  const text = fs.readFileSync(sessionRef, "utf8");
   let n = 0;
   for (let i = 0; i < text.length; i++) if (text[i] === "\n") n++;
   return n;
 }
 
-function operationId(input: HookInput, preBlobHash: string | null): string {
-  if (input.tool_use_id) return input.tool_use_id;
-  // フォールバック合成キー(詳細設計書4.1と同一方式)
-  const file = input.tool_input?.file_path ?? input.tool_input?.notebook_path ?? "";
-  return `synth:${input.session_id ?? "nosession"}:${file}:${(preBlobHash ?? "null").slice(0, 8)}`;
+function sessionIdOf(input: HookInput): string {
+  const sid = input.session_id ?? (input as { sessionID?: string }).sessionID;
+  return typeof sid === "string" && sid ? sid : "nosession";
+}
+
+/** ネイティブIDが無いときの合成キー(詳細設計書4.1と同一方式) */
+function synthOperationId(input: HookInput, rawFile: string, preBlobHash: string | null): string {
+  return `synth:${sessionIdOf(input)}:${rawFile}:${(preBlobHash ?? "null").slice(0, 8)}`;
+}
+
+/** post時にファイルが判らない場合、同一operation_idのpreイベントからファイルを補う */
+function filesFromPriorPre(ws: Workspace, operationId: string): string[] {
+  const evs = readEvents(ws, "edits").events;
+  const files: string[] = [];
+  for (const e of evs) {
+    if (e.type !== "edit_pre") continue;
+    const p = e.payload as EditPre;
+    if (p.operation_id === operationId && !files.includes(p.file)) files.push(p.file);
+  }
+  return files;
+}
+
+export interface CaptureOptions {
+  /** --agent による自己申告(REQ-205)。環境変数による推測より常に優先する */
+  declaredAgent?: string | null;
 }
 
 /**
  * capture本体。絶対原則: いかなる場合もthrowしない(exit 0 = 開発を止めない)。
  * 戻り値はテスト用の観測情報。
  */
-export function runCapture(ws: Workspace, phase: "pre" | "post", input: HookInput): { recorded: boolean; reason?: string } {
+export function runCapture(
+  ws: Workspace,
+  phase: "pre" | "post",
+  input: HookInput,
+  opts: CaptureOptions = {},
+): { recorded: boolean; reason?: string; agent?: string; files?: string[] } {
   try {
-    const toolName = input.tool_name ?? "";
-    if (!TARGET_TOOLS.has(toolName)) return { recorded: false, reason: "non-target-tool" };
     const cfg = loadConfig(ws.provenDir);
-    const rawPath = (input.tool_input?.file_path ?? input.tool_input?.notebook_path) as string | undefined;
-    if (!rawPath) return { recorded: false, reason: "no-file-path" };
-    const resolved = resolveCapturePath(ws, rawPath, cfg.capture.exclude);
-    if (!resolved) return { recorded: false, reason: "excluded-or-outside" };
+    const resolved = resolveAgent({ declared: opts.declaredAgent ?? null, raw: input as Record<string, unknown> });
+    const detection: AgentDetectionRecord = resolved.detection;
+    const norm: NormalizedCapture | null = resolved.adapter.normalize(input as Record<string, unknown>, phase);
+    if (!norm || !norm.isTargetTool) return { recorded: false, reason: "non-target-tool", agent: resolved.agent };
 
-    const exists = fs.existsSync(resolved.abs) && fs.statSync(resolved.abs).isFile();
-    const content = exists ? fs.readFileSync(resolved.abs) : null;
-    let blobHash: string | null = null;
-    if (content !== null) {
-      const put = putObject(ws, content);
-      blobHash = put.hash;
+    let rawFiles = norm.files;
+    // post時にファイルが判らないハーネスは、preイベントから補完する(1操作N ファイル対応)
+    if (phase === "post" && rawFiles.length === 0 && norm.operationIdNative) {
+      rawFiles = filesFromPriorPre(ws, norm.operationIdNative);
     }
+    if (rawFiles.length === 0) return { recorded: false, reason: "no-file-path", agent: resolved.agent };
 
-    if (phase === "pre") {
-      const payload: EditPre = {
-        operation_id: operationId(input, blobHash),
-        agent: "claude-code",
-        session_ref: input.transcript_path ?? "",
-        file: resolved.rel,
-        pre_blob_hash: blobHash,
-        tool: toolName as EditTool,
-        conversation_ref: (() => {
-          const line = transcriptTailLine(input.transcript_path);
-          return line === null ? null : { transcript_line: line };
-        })(),
-      };
-      appendEvent(ws, "edits", "edit_pre", payload);
-    } else {
-      const respOk = !(
-        typeof input.tool_response === "object" &&
-        input.tool_response !== null &&
-        ("error" in (input.tool_response as object) || (input.tool_response as { success?: boolean }).success === false)
-      );
-      // tool_use_id欠落時: 同一session+fileの最新未マッチsynth preのキーへ対応付け(4.1)
-      let opId = input.tool_use_id ?? null;
-      if (!opId) {
-        const evs = readEvents(ws, "edits").events;
-        const posts = new Set(
-          evs.filter((e) => e.type === "edit_post").map((e) => (e.payload as EditPost).operation_id),
-        );
-        for (let i = evs.length - 1; i >= 0; i--) {
-          const e = evs[i];
-          if (e.type !== "edit_pre") continue;
-          const p = e.payload as EditPre;
-          if (!p.operation_id.startsWith("synth:")) continue;
-          if (p.session_ref === (input.transcript_path ?? "") || p.operation_id.includes(`:${resolved.rel}:`)) {
-            if (!posts.has(p.operation_id)) {
-              opId = p.operation_id;
-              break;
-            }
-          }
-        }
-        if (!opId) opId = operationId(input, blobHash);
+    const transcriptLine =
+      resolved.adapter.capabilities.transcript === "sdk" || resolved.adapter.capabilities.transcript === "none"
+        ? null
+        : transcriptTailLine(norm.sessionRef);
+
+    const recordedFiles: string[] = [];
+    for (const rawFile of rawFiles) {
+      const target = resolveCapturePath(ws, rawFile, cfg.capture.exclude);
+      if (!target) continue; // リポジトリ外/除外
+
+      const exists = fs.existsSync(target.abs) && fs.statSync(target.abs).isFile();
+      const content = exists ? fs.readFileSync(target.abs) : null;
+      const blobHash = content !== null ? putObject(ws, content).hash : null;
+
+      if (phase === "pre") {
+        const payload: EditPre = {
+          operation_id: norm.operationIdNative ?? synthOperationId(input, rawFile, blobHash),
+          agent: resolved.agent,
+          session_ref: norm.sessionRef,
+          file: target.rel,
+          pre_blob_hash: blobHash,
+          tool: norm.tool,
+          conversation_ref: transcriptLine === null ? null : { transcript_line: transcriptLine },
+          agent_detection: detection,
+        };
+        appendEvent(ws, "edits", "edit_pre", payload);
+      } else {
+        const opId = norm.operationIdNative ?? resolvePostOperationId(ws, input, norm, target.rel, blobHash);
+        const payload: EditPost = {
+          operation_id: opId,
+          result_blob_hash: blobHash,
+          tool_status: norm.toolStatus === "failure" ? "failure" : "success",
+          file: target.rel,
+        };
+        appendEvent(ws, "edits", "edit_post", payload);
       }
-      const payload: EditPost = {
-        operation_id: opId,
-        result_blob_hash: content !== null ? blobHash : null,
-        tool_status: respOk ? "success" : "failure",
-      };
-      appendEvent(ws, "edits", "edit_post", payload);
+      recordedFiles.push(target.rel);
     }
-    return { recorded: true };
+
+    if (recordedFiles.length === 0) return { recorded: false, reason: "excluded-or-outside", agent: resolved.agent };
+    return { recorded: true, agent: resolved.agent, files: recordedFiles };
   } catch (e) {
     logCaptureError(ws, `capture ${phase} failed: ${String(e)}`);
     return { recorded: false, reason: `error: ${String(e)}` };
   }
+}
+
+/**
+ * ネイティブID欠落時のpost対応付け(詳細設計書4.1)。
+ * 同一session+fileの最新未マッチsynth preのキーへ寄せ、無ければ同じ合成規則で作る。
+ */
+function resolvePostOperationId(
+  ws: Workspace,
+  input: HookInput,
+  norm: NormalizedCapture,
+  rel: string,
+  blobHash: string | null,
+): string {
+  const evs = readEvents(ws, "edits").events;
+  const posts = new Set(evs.filter((e) => e.type === "edit_post").map((e) => (e.payload as EditPost).operation_id));
+  for (let i = evs.length - 1; i >= 0; i--) {
+    const e = evs[i];
+    if (e.type !== "edit_pre") continue;
+    const p = e.payload as EditPre;
+    if (!p.operation_id.startsWith("synth:")) continue;
+    if (p.session_ref === norm.sessionRef || p.operation_id.includes(`:${rel}:`)) {
+      if (!posts.has(p.operation_id)) return p.operation_id;
+    }
+  }
+  const rawFile = norm.files[0] ?? rel;
+  return synthOperationId(input, rawFile, blobHash);
 }
