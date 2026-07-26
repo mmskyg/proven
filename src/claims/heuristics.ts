@@ -90,6 +90,9 @@ export function emitClaimsForHunk(ws: Workspace, db: Sqlite.Database, input: Cla
   );
   if (input.attribution.status === "uncaptured") {
     instructedReason = "編集イベントが捕捉されていないため会話と照合できない";
+  } else if (input.attribution.status === "candidate") {
+    // 帰属が候補どまりの段階で会話と照合すると、推定の上に推定を重ねることになる(REQ-411)
+    instructedReason = "帰属が候補どまり(連鎖断絶)のため、会話との照合は行わない";
   } else if (linkedEvents.length === 0) {
     instructedReason = "帰属イベントに会話文脈参照がない";
   } else {

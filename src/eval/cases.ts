@@ -6,6 +6,7 @@ import type { Workspace } from "../store/paths.js";
 import { fileContent, manifestMap, resolveRevision } from "../ingest/revision.js";
 import { gitNoIndexHunks } from "../ingest/diff.js";
 import fs from "node:fs";
+import { isInformativeLine, multisetIntersect } from "../shared/lines.js";
 
 /**
  * 受入計測ケースの生成(AIエージェントが判定を代行できる形式)。
@@ -141,6 +142,8 @@ function hunkDiffText(ws: Workspace, h: HunkRow): string {
 
 const EVENT_DIFF_MAX_LINES = 20;
 
+export { isInformativeLine };
+
 export interface AttributionBasis {
   pre_blob: string | null;
   post_blob: string | null;
@@ -158,40 +161,6 @@ export interface AttributionBasis {
  * 一致行の情報量判定(REQ-309)。
  * `}` `);` `return null;` のような定型行は偶然一致しやすく、単独では証拠にならない。
  */
-const KEYWORDS = new Set([
-  "return", "null", "true", "false", "else", "const", "let", "var", "new", "this", "void", "undefined",
-  "if", "for", "while", "break", "continue", "try", "catch", "finally", "throw", "case", "switch",
-  "default", "import", "export", "function", "class", "async", "await", "type", "interface", "enum",
-  "public", "private", "protected", "static", "readonly", "from", "as", "in", "of", "do", "end", "def",
-  "string", "number", "boolean", "any", "unknown", "never", "object",
-]);
-
-export function isInformativeLine(line: string): boolean {
-  const t = line.trim();
-  if (t.length < 8) return false;
-  if (!/[A-Za-z0-9_぀-ヿ一-鿿]/.test(t)) return false; // 記号のみ
-  if (/["'`].{4,}["'`]/.test(t)) return true; // 長いリテラルを含む
-  // 予約語だけで構成される定型行(`return null;` 等)は固有の情報を持たない
-  const idents = (t.match(/[A-Za-z_][A-Za-z0-9_]{2,}/g) ?? []).filter((w) => !KEYWORDS.has(w));
-  if (idents.length >= 2) return true;
-  return t.length >= 40 && idents.length >= 1;
-}
-
-/** 多重度を保った積(Set比較だと同じ行の複数出現を1回の一致でfull扱いしてしまう) */
-function multisetIntersect(target: string[], source: string[]): string[] {
-  const remaining = new Map<string, number>();
-  for (const l of source) remaining.set(l, (remaining.get(l) ?? 0) + 1);
-  const out: string[] = [];
-  for (const l of target) {
-    const c = remaining.get(l) ?? 0;
-    if (c > 0) {
-      remaining.set(l, c - 1);
-      out.push(l);
-    }
-  }
-  return out;
-}
-
 const OVERLAP_NOTE =
   "このイベントの差分に、hunkと同じ文字列の変更行が含まれることのみを示す。帰属の十分条件ではない" +
   "(頻出行の偶然一致・formatterの削除再追加・別主体による同一文字列の再追加があり得る)";

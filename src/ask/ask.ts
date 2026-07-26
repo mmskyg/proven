@@ -66,7 +66,11 @@ export function runAsk(ws: Workspace, target: string, _question: string): AskAns
   const db = openDbChecked(ws);
   try {
     const hunk = resolveTarget(db, target);
-    const noLineage = hunk.edit_capture_status === "uncaptured" || hunk.lineage_status === "broken";
+    // candidateも帰属は未確定なので「来歴あり」とは扱わない(REQ-411)
+    const noLineage =
+      hunk.edit_capture_status === "uncaptured" ||
+      hunk.lineage_status === "broken" ||
+      hunk.lineage_status === "candidate";
     const observed: string[] = [];
     const aiExplanation: string[] = [];
     const specRelation: string[] = [];
@@ -92,6 +96,15 @@ export function runAsk(ws: Workspace, target: string, _question: string): AskAns
         "経緯情報なし: この変更に対応する捕捉イベントを確認できません(uncaptured)。" +
           "hook外の変更(手編集・formatter等)か、途中の編集が記録されず連鎖が切れた可能性があります",
       );
+    } else if (hunk.lineage_status === "candidate") {
+      // REQ-410: 観測事実 / 判定 / 推定を分けて出す。「このイベントが作った」と断定しない
+      observed.push("帰属は判定不能(連鎖断絶)。以下は確定した帰属ではなく候補です");
+      for (const l of links) {
+        observed.push(
+          `候補: ${l.ts_pre} のedit_event ${l.operation_id.slice(0, 12)}… (${l.agent}) に同一内容の変更行があります`,
+        );
+      }
+      if (links.length > 1) observed.push("候補が複数あり、どれが作ったかは決められません(ambiguous)");
     } else {
       for (const l of links) {
         observed.push(

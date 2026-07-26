@@ -151,7 +151,7 @@ program
       const human = r.noop
         ? [`同一入力のため変更なし(no-op): job ${r.jobId}`]
         : [
-            `取り込み: ${r.hunks} hunks (linked ${r.linked} / uncaptured ${r.uncaptured} / broken ${r.broken})`,
+            `取り込み: ${r.hunks} hunks (linked ${r.linked} / candidate ${r.candidate} / uncaptured ${r.uncaptured} / broken ${r.broken})`,
             ...(r.skippedFiles.length ? [`レビュー対象外: ${r.skippedFiles.join(", ")}`] : []),
           ];
       emitResult(ctx, "ingest", "ok", r, human);

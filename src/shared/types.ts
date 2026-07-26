@@ -84,10 +84,13 @@ export type LineageLinked =
   | {
       hunk_instance_id: string;
       edit_capture_status: "captured";
-      lineage_status: "linked" | "broken";
+      /** candidate = 内容上の対応候補はあるが連鎖断絶で帰属は確定できない(REQ-401) */
+      lineage_status: "linked" | "broken" | "candidate";
       context_status: "ok" | "transcript_broken";
+      /** candidateでは確定帰属ではなく「候補」を指す(REQ-402) */
       edit_event_refs: string[];
-      method: "blob-chain";
+      /** candidateはblob-chainではなく内容一致で導出される(REQ-402) */
+      method: "blob-chain" | "content-match";
       confidence: number;
     }
   | {

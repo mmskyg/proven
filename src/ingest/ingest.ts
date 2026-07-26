@@ -35,6 +35,8 @@ export interface IngestSummary {
   linked: number;
   uncaptured: number;
   broken: number;
+  /** 内容一致の候補のみ(連鎖断絶)。linked/uncapturedのどちらにも数えない(REQ-411) */
+  candidate: number;
   excludedFiles: number;
   skippedFiles: string[]; // binary/oversize等レビュー対象外
   orphanPosts: number;
@@ -123,7 +125,7 @@ export function runIngest(ws: Workspace, opts: { range?: string } = {}): IngestS
     applyAndAppend(ws, db, "analysis", "ingest_run", runPayload);
 
     const rid = repoId(ws);
-    const counters = { linked: 0, uncaptured: 0, broken: 0 };
+    const counters = { linked: 0, uncaptured: 0, broken: 0, candidate: 0 };
     const claimCounters: Record<string, number> = {};
     let hunkTotal = 0;
 
@@ -243,7 +245,9 @@ export function runIngest(ws: Workspace, opts: { range?: string } = {}): IngestS
             confidence: null,
           };
         } else {
+          // candidateはlinkedにもuncapturedにも数えない(REQ-411)
           if (attr.status === "linked") counters.linked++;
+          else if (attr.status === "candidate") counters.candidate++;
           else counters.broken++;
           linkEvent = {
             hunk_instance_id: hid,
@@ -251,7 +255,7 @@ export function runIngest(ws: Workspace, opts: { range?: string } = {}): IngestS
             lineage_status: attr.status,
             context_status: transcriptBroken ? "transcript_broken" : "ok",
             edit_event_refs: attr.refs,
-            method: "blob-chain",
+            method: attr.method ?? "blob-chain",
             confidence: attr.confidence ?? 0.4,
           };
         }
@@ -279,6 +283,7 @@ export function runIngest(ws: Workspace, opts: { range?: string } = {}): IngestS
       linked: counters.linked,
       uncaptured: counters.uncaptured,
       broken: counters.broken,
+      candidate: counters.candidate,
       excludedFiles: excludedCount,
       skippedFiles,
       orphanPosts: orphanRow ? Number(orphanRow.value) : 0,
@@ -308,6 +313,7 @@ function emptySummary(jobId: string, baseRef: string, headRef: string, noop: boo
     linked: 0,
     uncaptured: 0,
     broken: 0,
+    candidate: 0,
     excludedFiles: 0,
     skippedFiles: [],
     orphanPosts: 0,

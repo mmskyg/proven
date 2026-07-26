@@ -90,7 +90,11 @@ export function runTriage(ws: Workspace): TriageResult {
         factors.push({ factor: "unsolicited-candidate", points: 30 });
         unsolicitedCount++;
       }
-      const noLineage = h.edit_capture_status === "uncaptured" || h.lineage_status === "broken";
+      // candidateは帰属未確定なので精読対象。表示はuncapturedと区別する(REQ-411)
+      const noLineage =
+        h.edit_capture_status === "uncaptured" ||
+        h.lineage_status === "broken" ||
+        h.lineage_status === "candidate";
       if (noLineage) factors.push({ factor: "no-lineage", points: 25 });
       if (hasNewExternal(h, db)) factors.push({ factor: "new-external-dep", points: 20 });
       const refApprox = referencedApprox(ws, db, h.hunk_instance_id);

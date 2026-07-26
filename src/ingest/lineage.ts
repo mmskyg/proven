@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import { myersDiff, splitLines, type DiffOp, type RawHunk } from "./diff.js";
+import { isDistinctiveLine, isInformativeLine, longestInformativeRun, multisetIntersect } from "../shared/lines.js";
 
 /**
  * provenance map方式のlineage構築(詳細設計書4.3)。
@@ -22,9 +23,19 @@ export interface GapSpan {
   len: number;
 }
 
+/** 各イベント自身が作った変更行(内容一致による候補検出に使う・REQ-403) */
+export interface EventContent {
+  operationId: string;
+  addedLines: string[];
+  removedLines: string[];
+  /** イベント全体の変更行数。巨大イベントの偶然一致を弱めるため(REQ-408) */
+  size: number;
+}
+
 export interface FileLineage {
   eventSpans: EventSpan[];
   gapSpans: GapSpan[];
+  eventContents: EventContent[];
   hadGap: boolean;
   chainComplete: boolean; // gapなしで base→head が繋がった
 }
@@ -108,6 +119,18 @@ export function computeFileLineage(
 ): FileLineage {
   const eventSpans: EventSpan[] = [];
   const gapSpans: GapSpan[] = [];
+  // 各イベント自身が作った変更行(連鎖が切れたときの候補検出用)
+  const eventContents: EventContent[] = events.map((ev) => {
+    const a = splitLines(ev.pre);
+    const b = splitLines(ev.post);
+    const added: string[] = [];
+    const removed: string[] = [];
+    for (const op of myersDiff(a, b)) {
+      if (op.type === "ins") for (let i = 0; i < op.len; i++) added.push(b[op.bStart + i]);
+      else if (op.type === "del") for (let i = 0; i < op.len; i++) removed.push(a[op.aStart + i]);
+    }
+    return { operationId: ev.operationId, addedLines: added, removedLines: removed, size: added.length + removed.length };
+  });
   // セグメント列構築
   const segments: Segment[] = [];
   let cursor = baseContent;
@@ -161,7 +184,7 @@ export function computeFileLineage(
       }
     }
   }
-  return { eventSpans, gapSpans, hadGap, chainComplete: !hadGap && events.length > 0 };
+  return { eventSpans, gapSpans, eventContents, hadGap, chainComplete: !hadGap && events.length > 0 };
 }
 
 function intersects(span: { start: number; len: number }, hunkStart0: number, hunkLen: number): boolean {
@@ -174,10 +197,80 @@ function intersects(span: { start: number; len: number }, hunkStart0: number, hu
 }
 
 export interface HunkAttribution {
-  status: "linked" | "broken" | "uncaptured";
-  refs: string[]; // operation_id
+  status: "linked" | "broken" | "candidate" | "uncaptured";
+  refs: string[]; // operation_id。candidateでは「候補」であって確定帰属ではない(REQ-402)
   confidence: number | null;
   gapCause: { whitespaceOnly: boolean } | null; // uncaptured/broken時の原因gap
+  /** 帰属の導出方式。candidateはblob-chainではなく内容一致(REQ-402) */
+  method?: "blob-chain" | "content-match";
+  /** candidate時の根拠(REQ-410の「観測事実」を出すため) */
+  candidateEvidence?: {
+    matchedLines: string[];
+    runLength: number;
+    bothSides: boolean;
+    ambiguous: boolean;
+  };
+}
+
+const CANDIDATE_CONF_MAX = 0.4;
+
+/**
+ * 連鎖が切れて位置で追えないとき、内容一致で候補を探す(REQ-403〜409)。
+ * 見つからなければnull(=従来どおりuncaptured)。
+ * 内容一致は帰属の確定根拠ではないので、confidenceは構造的broken(0.4)を超えない。
+ */
+export function findContentCandidates(
+  contents: EventContent[],
+  hunk: RawHunk,
+): { refs: string[]; confidence: number; evidence: NonNullable<HunkAttribution["candidateEvidence"]> } | null {
+  interface Scored {
+    operationId: string;
+    score: number;
+    matched: string[];
+    runLength: number;
+    bothSides: boolean;
+  }
+  const scored: Scored[] = [];
+  for (const c of contents) {
+    // 符号を区別して突き合わせる(追加は追加どうし・削除は削除どうし)
+    const addMatched = multisetIntersect(hunk.addedLines, c.addedLines).filter(isInformativeLine);
+    const delMatched = multisetIntersect(hunk.removedLines, c.removedLines).filter(isInformativeLine);
+    const matched = [...addMatched, ...delMatched];
+    if (matched.length === 0) continue;
+
+    const runLength = Math.max(
+      longestInformativeRun(hunk.addedLines, c.addedLines),
+      longestInformativeRun(hunk.removedLines, c.removedLines),
+    );
+    const distinctive = matched.some(isDistinctiveLine);
+    // 候補として採る条件: 情報量のある連続2行以上、または特徴的な1行(REQ-405)
+    if (runLength < 2 && !distinctive) continue;
+
+    let score = runLength >= 2 ? 0.3 : 0.2;
+    const bothSides = addMatched.length > 0 && delMatched.length > 0;
+    if (bothSides) score += 0.1;
+    // 巨大イベントの偶然一致を弱める(REQ-408)
+    if (c.size > 50 && matched.length / c.size < 0.1) score -= 0.1;
+    score = Math.max(0.1, Math.min(CANDIDATE_CONF_MAX, Number(score.toFixed(2))));
+    scored.push({ operationId: c.operationId, score, matched, runLength, bothSides });
+  }
+  if (scored.length === 0) return null;
+
+  const best = Math.max(...scored.map((s) => s.score));
+  const top = scored.filter((s) => s.score === best);
+  const ambiguous = top.length > 1;
+  // 同点なら1つに絞らない。confidenceも上げない(REQ-407)
+  const confidence = ambiguous ? Math.min(0.2, best) : best;
+  return {
+    refs: top.map((s) => s.operationId),
+    confidence,
+    evidence: {
+      matchedLines: top[0].matched.slice(0, 5),
+      runLength: Math.max(...top.map((s) => s.runLength)),
+      bothSides: top.some((s) => s.bothSides),
+      ambiguous,
+    },
+  };
 }
 
 /** hunk(git座標: newStart 1-origin)へのイベント帰属(4.3 step4) */
@@ -199,11 +292,23 @@ export function attributeHunk(lineage: FileLineage, hunk: RawHunk): HunkAttribut
       break;
     }
   }
+  // 既存の構造的判定は変更しない(REQ-412)。candidateはuncapturedだった一部だけを引き取る
   if (hitUntainted.size > 0) {
-    return { status: "linked", refs: [...hitUntainted, ...hitTainted], confidence: 1.0, gapCause: null };
+    return { status: "linked", refs: [...hitUntainted, ...hitTainted], confidence: 1.0, gapCause: null, method: "blob-chain" };
   }
   if (hitTainted.size > 0) {
-    return { status: "broken", refs: [...hitTainted], confidence: 0.4, gapCause };
+    return { status: "broken", refs: [...hitTainted], confidence: 0.4, gapCause, method: "blob-chain" };
+  }
+  const candidate = findContentCandidates(lineage.eventContents, hunk);
+  if (candidate) {
+    return {
+      status: "candidate",
+      refs: candidate.refs,
+      confidence: candidate.confidence,
+      gapCause,
+      method: "content-match",
+      candidateEvidence: candidate.evidence,
+    };
   }
   return { status: "uncaptured", refs: [], confidence: null, gapCause };
 }
