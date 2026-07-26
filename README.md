@@ -82,7 +82,11 @@ Node.js 20以上。SQLiteのネイティブモジュール(better-sqlite3)をビ
 
 ### 未実装(設計にはあるが動かない)
 
-- **LLM層**: 既定OFFで、プロバイダ実装自体がありません。`llm.enabled=true` にしても高精度claimやaskの推測セクションは出ません。シークレットマスキングとプロンプト隔離の実装だけ先行しています。
+- **LLM層**: 既定OFF。有効化すると `proven llm-judge` で第二段判定が動きます(ヒューリスティックが判定不能とした変更だけが対象)。
+  断定には根拠となる句の引用を必須とし、引用のない断定は破棄します。confidenceは0.7が上限で、LLM由来のclaimは
+  `method=llm` / モデル名 / プロンプトのdigest つきで記録され、常に未検証(AI仮説)扱いです。
+  `ask` の推測セクションは未実装です。プロバイダは Anthropic API のほか、APIキーが無い場合はローカルの `claude` CLI を使えます
+  (`proven config llm.provider claude-cli`)。**この層の精度は未計測です。**
 - **Phase 2以降の全機能**: レビューTUI(`review`)、検証バッテリー(`verify`)、承認記録(`attest`)、ルール学習(`learn`)、文体lint(`docstyle`)、メトリクス(`report`)は未着手です。
 - `ingest` の `--resume`、LLM予算オプション(`--max-llm-calls` / `--budget`)、lineageの時間予算による中断は未実装です。編集履歴が多いファイルで処理時間が伸びる可能性があります。
 - triageの「被参照数」加点は常に無効です(実装が空)。加点表の他の項目は動作します。
@@ -105,7 +109,7 @@ Node.js 20以上。SQLiteのネイティブモジュール(better-sqlite3)をビ
 
 ### 検証済みのこと
 
-- 自動テスト164件(vitest)が通ります。イベントストアからのprojection完全再構築、事実とclaimの峻別、プロンプトインジェクションの隔離、hookが開発をブロックしないこと、来歴チェーンの改ざん検知などを含みます。
+- 自動テスト191件(vitest)が通ります。イベントストアからのprojection完全再構築、事実とclaimの峻別、プロンプトインジェクションの隔離、hookが開発をブロックしないこと、来歴チェーンの改ざん検知などを含みます。
 - Codex / OpenCode 対応は実機で確認しました。Codexは1回の `apply_patch` で2ファイルを変更したケースが同一操作IDで記録され、rolloutから当時のユーザー発話を引いて「明示指示あり」まで到達しています。OpenCodeはプラグイン経由でpre/postが対で記録されます。ただし**どちらも精度は未計測**です(上記のとおり)。
 - Proven自身のリポジトリでのドッグフーディングで、指示されていないAIの自律修正をunsolicited候補として検出し、実transcriptから当時のAI説明を引用できることを確認しました。
 - 同じドッグフーディングで実バグを2件見つけて直しました(ネストしたリポジトリでの捕捉先の誤り、日本語の指示とコンテンツが照合できない問題)。いずれも回帰テストつきです。
@@ -130,7 +134,7 @@ Node.js 20以上。SQLiteのネイティブモジュール(better-sqlite3)をビ
 ## テスト
 
 ```bash
-npm test        # vitest 164件
+npm test        # vitest 191件
 npm run typecheck
 ```
 
