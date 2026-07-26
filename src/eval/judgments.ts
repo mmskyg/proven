@@ -112,6 +112,22 @@ export function submitJudgments(
   }
 }
 
+/** claim値ごとの内訳(REQ-705)。断定と判定不能を混ぜない */
+export interface ClaimBreakdown {
+  /** 断定claim(あり/支持)のうち correct の割合 */
+  determinatePrecision: string;
+  determinateCorrect: number;
+  determinateJudged: number;
+  /** 判定不能claimのうち correct の割合 */
+  abstentionAccuracy: string;
+  abstentionCorrect: number;
+  abstentionJudged: number;
+  /** 全判定に占める「断定して間違えた」割合 */
+  falseAssertionRate: string;
+  /** 全claimのうち断定できた割合(母集団ベース) */
+  coverage: string;
+}
+
 export interface EvalReport {
   kind: EvalKind;
   population: number;
@@ -121,6 +137,8 @@ export interface EvalReport {
   needsHumanReview: string[]; // AIがunsure/incorrectとしたもの=人間が優先確認すべき
   threshold: number;
   acceptancePassed: boolean | null; // 人間確認済みのみで判定。判定不能はnull
+  /** claim評価の内訳(kind=claimsのみ・REQ-705) */
+  claimBreakdown?: ClaimBreakdown;
   lines: string[];
 }
 
@@ -170,9 +188,50 @@ export function reportEval(ws: Workspace, kind: EvalKind): EvalReport {
       .map(([k]) => k.slice(3))
       .filter((id) => !latest.has(`human:${id}`));
 
+    // REQ-705: claimは断定と判定不能を分けて評価する。
+    // 正しい判定不能が誤断定を覆い隠すと、全体率だけでは実態が見えない
+    let claimBreakdown: ClaimBreakdown | undefined;
+    if (kind === "claims") {
+      const claimRows = db
+        .prepare("SELECT claim_id, value FROM claims WHERE kind IN ('instructed','spec_support')")
+        .all() as { claim_id: string; value: string }[];
+      const valueOf = new Map(claimRows.map((r) => [r.claim_id, r.value]));
+      const isDeterminate = (id: string): boolean => {
+        const v = valueOf.get(id);
+        return v !== undefined && v !== "判定不能";
+      };
+      let dc = 0, dj = 0, ac = 0, aj = 0;
+      for (const [k, v] of latest) {
+        if (!k.startsWith("human:")) continue;
+        const id = k.slice(6);
+        if (v.verdict === "unsure") continue;
+        if (isDeterminate(id)) {
+          dj++;
+          if (v.verdict === "correct") dc++;
+        } else {
+          aj++;
+          if (v.verdict === "correct") ac++;
+        }
+      }
+      const determinateTotal = claimRows.filter((r) => r.value !== "判定不能").length;
+      claimBreakdown = {
+        determinatePrecision: pct(dc, dj),
+        determinateCorrect: dc,
+        determinateJudged: dj,
+        abstentionAccuracy: pct(ac, aj),
+        abstentionCorrect: ac,
+        abstentionJudged: aj,
+        falseAssertionRate: pct(dj - dc, dj + aj),
+        coverage: pct(determinateTotal, claimRows.length),
+      };
+    }
+
     const threshold = kind === "lineage" ? 0.9 : 0.8;
-    const humanDecided = human.correct + human.incorrect;
-    const meetsThreshold = humanDecided === 0 ? null : human.correct / humanDecided >= threshold;
+    // REQ-705: claimの受入基準は「断定precision」に対して適用する
+    const humanDecided =
+      kind === "claims" && claimBreakdown ? claimBreakdown.determinateJudged : human.correct + human.incorrect;
+    const humanCorrect = kind === "claims" && claimBreakdown ? claimBreakdown.determinateCorrect : human.correct;
+    const meetsThreshold = humanDecided === 0 ? null : humanCorrect / humanDecided >= threshold;
     // REQ-305: サンプルが少ないうちはPASSを出さない。基準割れ(FAIL)は少数でも事実として出す
     const acceptancePassed =
       meetsThreshold === null ? null : meetsThreshold && humanDecided < MIN_HUMAN_SAMPLE ? null : meetsThreshold;
@@ -190,14 +249,21 @@ export function reportEval(ws: Workspace, kind: EvalKind): EvalReport {
       `対象母集団: ${population}件`,
       `AI判定(unverified): ${ai.judged}件 — 正解率 ${ai.rate} (unsure ${ai.unsure}件は母数外)`,
       `人間確認済み(human-confirmed): ${human.judged}件 — 正解率 ${human.rate} (unsure ${human.unsure}件は母数外)`,
-      `受入基準(${kind === "lineage" ? "lineage 90%" : "claim 80%"}): ${verdictText}`,
+      `受入基準(${kind === "lineage" ? "lineage 90%" : "claim 80%(断定precisionに適用)"}): ${verdictText}`,
       `※AI判定は検証済みではありません(設計原則2)。受入合否は人間確認済みのみで判定しています。`,
     ];
+    if (claimBreakdown) {
+      lines.push(
+        `断定precision(あり/支持): ${claimBreakdown.determinatePrecision} (${claimBreakdown.determinateCorrect}/${claimBreakdown.determinateJudged}) ※人間確認済み`,
+        `判定不能の妥当率: ${claimBreakdown.abstentionAccuracy} (${claimBreakdown.abstentionCorrect}/${claimBreakdown.abstentionJudged}) ※人間確認済み`,
+        `誤断定率: ${claimBreakdown.falseAssertionRate} / 判定可能率(coverage): ${claimBreakdown.coverage}`,
+      );
+    }
     if (disagreements.length) lines.push(`AIと人間の不一致: ${disagreements.length}件 → ${disagreements.map((d) => d.case_id.slice(0, 8)).join(", ")}`);
     if (needsHumanReview.length)
       lines.push(`人間が優先確認すべきケース(AIがunsure/incorrectとした未確認分): ${needsHumanReview.length}件`);
 
-    return { kind, population, ai, human, disagreements, needsHumanReview, threshold, acceptancePassed, lines };
+    return { kind, population, ai, human, disagreements, needsHumanReview, threshold, acceptancePassed, claimBreakdown, lines };
   } finally {
     db.close();
   }

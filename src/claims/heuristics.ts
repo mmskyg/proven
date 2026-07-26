@@ -11,7 +11,7 @@ import {
 import { appendEvent } from "../store/events.js";
 import { applyEvent } from "../store/projections.js";
 import type { Workspace } from "../store/paths.js";
-import { searchSpec, tokenize } from "../spec/index.js";
+import { searchSpec, specParagraph, tokenize } from "../spec/index.js";
 import { adapterById, claudeCodeAdapter } from "../agents/index.js";
 import type { RawHunk } from "../ingest/diff.js";
 import type { HunkAttribution } from "../ingest/lineage.js";
@@ -52,20 +52,80 @@ export function recentUserUtterances(
   return adapter.readUtterances(sessionRef, beforeLine, max);
 }
 
-function hunkIdentifiers(file: string, hunk: RawHunk): string[] {
-  const base = file.split("/").pop() ?? file;
-  const stem = base.replace(/\.[^.]+$/, "");
-  const ids = new Set<string>([base.toLowerCase(), stem.toLowerCase()]);
-  for (const l of [...hunk.addedLines, ...hunk.removedLines]) for (const t of tokenize(l)) ids.add(t);
-  return [...ids];
+/**
+ * 対象一致に数えない汎用語(REQ-703)。
+ * `user` `message` のような語はどの発話にも出るため、これで一致しても
+ * 「その変更を指示した」証拠にならない(実測で誤断定の原因になっていた)。
+ */
+/** 探索する編集前user発話の上限(REQ-702)。到達しても否定の証拠にはしない */
+const UTTERANCE_SCAN_MAX = 200;
+
+const GENERIC_TOKENS = new Set([
+  "user", "message", "type", "types", "data", "value", "values", "name", "names", "file", "files",
+  "path", "paths", "text", "string", "number", "boolean", "object", "array", "list", "item", "items",
+  "test", "tests", "code", "line", "lines", "result", "results", "error", "errors", "status", "input",
+  "output", "config", "option", "options", "key", "keys", "id", "ids", "index", "count", "size",
+  "return", "const", "let", "var", "function", "class", "import", "export", "async", "await", "null",
+  "true", "false", "this", "new", "case", "default", "public", "private", "static", "interface",
+  "実装", "変更", "修正", "追加", "対応", "確認", "作成", "処理", "使用", "実行", "設定", "問題",
+]);
+
+export interface HunkTargets {
+  /** ファイル名・パス(basename と拡張子なし stem) */
+  fileNames: string[];
+  /** 変更行に含まれる固有識別子(汎用語を除く) */
+  symbols: string[];
 }
 
-function matchRate(utterance: string, identifiers: string[]): { rate: number; hit: string[] } {
+/** hunkの「変更対象」を取り出す(REQ-703)。汎用語は対象一致に数えない */
+export function hunkTargets(file: string, hunk: RawHunk): HunkTargets {
+  const base = file.split("/").pop() ?? file;
+  const stem = base.replace(/\.[^.]+$/, "");
+  const symbols = new Set<string>();
+  for (const l of [...hunk.addedLines, ...hunk.removedLines]) {
+    for (const t of tokenize(l)) {
+      // 日本語は2-gramで切られるため、ASCII識別子と同じ長さ閾値にすると全部落ちる
+      if (!isCjkToken(t) && t.length < 4) continue;
+      if (GENERIC_TOKENS.has(t)) continue;
+      if (t === stem.toLowerCase() || t === base.toLowerCase()) continue;
+      symbols.add(t);
+    }
+  }
+  return { fileNames: [base.toLowerCase(), stem.toLowerCase()], symbols: [...symbols] };
+}
+
+/** 後方互換: 従来の識別子一覧(仕様検索の候補抽出に使う) */
+function hunkIdentifiers(file: string, hunk: RawHunk): string[] {
+  const t = hunkTargets(file, hunk);
+  return [...t.fileNames, ...t.symbols];
+}
+
+/** 日本語(2-gramで切られる)トークンか */
+function isCjkToken(t: string): boolean {
+  return /[぀-ヿ一-鿿]/.test(t);
+}
+
+function containsToken(utterance: string, token: string): boolean {
   const utTokens = new Set(tokenize(utterance));
-  const utLower = utterance.toLowerCase();
-  const hit = identifiers.filter((id) => utTokens.has(id) || (id.length >= 4 && utLower.includes(id)));
-  const denom = Math.min(identifiers.length, 20) || 1;
-  return { rate: Math.min(1, hit.length / Math.min(denom, 6)), hit };
+  if (utTokens.has(token)) return true;
+  const minLen = isCjkToken(token) ? 2 : 4;
+  return token.length >= minLen && utterance.toLowerCase().includes(token);
+}
+
+/**
+ * 発話がこのhunkを指示していると言えるか(REQ-703)。
+ * 「変更対象(固有識別子)」と「要求された操作」の双方が同一発話に現れることを要求する。
+ * ファイル名だけの一致では断定しない(同名ファイルが複数ありうるため)。
+ */
+export function instructionMatch(
+  utterance: string,
+  targets: HunkTargets,
+): { matched: boolean; hitSymbols: string[]; hitFiles: string[] } {
+  const hitSymbols = targets.symbols.filter((s) => containsToken(utterance, s));
+  const hitFiles = targets.fileNames.filter((f) => f && containsToken(utterance, f));
+  // 固有識別子が2つ以上、またはファイル名+固有識別子の組で「対象が特定されている」とみなす
+  const targetIdentified = hitSymbols.length >= 2 || (hitFiles.length > 0 && hitSymbols.length >= 1);
+  return { matched: targetIdentified, hitSymbols, hitFiles };
 }
 
 function emit(ws: Workspace, db: Sqlite.Database, runId: string, c: Omit<ClaimEmitted, "claim_id" | "run_id">): void {
@@ -85,6 +145,12 @@ export function emitClaimsForHunk(ws: Workspace, db: Sqlite.Database, input: Cla
   let instructedConf = 0;
   let instructedReason = "";
   let instructedEvidence: EvidenceRef[] = [];
+  /**
+   * 断定(claim)とは別に持つ観測(REQ-701)。
+   * 「探索範囲内に明示指示を検出できなかった」は事実の否定ではないが、
+   * レビュー優先度の材料としては有効なので、claim値と分けて保持する。
+   */
+  let instructedObservation: "found" | "no_match_in_scope" | "not_searchable" = "not_searchable";
   const linkedEvents = input.events.filter((e) =>
     input.attribution.refs.length ? input.attribution.refs.includes(e.operationId) : false,
   );
@@ -100,28 +166,37 @@ export function emitClaimsForHunk(ws: Workspace, db: Sqlite.Database, input: Cla
     if (ev.transcriptLine === null || !fs.existsSync(ev.sessionRef)) {
       instructedReason = "transcriptが読めない(context_status=transcript_broken)";
     } else {
-      const utterances = recentUserUtterances(ev.sessionRef, ev.transcriptLine, 3, ev.agent);
+      // REQ-702: 探索範囲は「編集より前の同一セッションの全user発話」。
+      // 直近N件に限ると、少し前にある指示を見落として誤った断定につながる
+      const utterances = recentUserUtterances(ev.sessionRef, ev.transcriptLine, UTTERANCE_SCAN_MAX, ev.agent);
       if (utterances.length === 0) {
-        instructedReason = "直近のuser発話が見つからない";
+        instructedReason = "編集より前のuser発話が見つからない";
       } else {
-        let best: { u: UserUtterance; rate: number; hit: string[] } | null = null;
+        const targets = hunkTargets(input.file, input.hunk);
+        let best: { u: UserUtterance; hit: string[] } | null = null;
         for (const u of utterances) {
-          const m = matchRate(u.text, identifiers);
-          if (!best || m.rate > best.rate) best = { u, rate: m.rate, hit: m.hit };
+          const m = instructionMatch(u.text, targets);
+          if (m.matched) {
+            const hit = [...m.hitSymbols, ...m.hitFiles];
+            if (!best || hit.length > best.hit.length) best = { u, hit };
+          }
         }
-        if (best && best.rate >= 0.3) {
+        if (best) {
+          // REQ-703: 変更対象が発話中で特定できている場合のみ断定する
           instructedValue = "あり";
-          instructedConf = Math.min(HEURISTIC_CONF_MAX, 0.3 + best.rate * 0.2);
-          instructedReason = `直近user発話に対象語(${best.hit.slice(0, 3).join(", ")})が含まれる`;
+          instructedConf = Math.min(HEURISTIC_CONF_MAX, 0.3 + Math.min(best.hit.length, 3) * 0.05);
+          instructedReason = `user発話で変更対象が特定されている(${best.hit.slice(0, 3).join(", ")})`;
           instructedEvidence = [
             { type: "transcript", path: best.u.path, line: best.u.line, quote_digest: sha256(best.u.text) },
           ];
+          instructedObservation = "found";
         } else {
-          // v0.3境界: 3発話すべて検索して一致ゼロ→「なし」(conf 0.3)
-          instructedValue = "なし";
-          instructedConf = 0.3;
-          instructedReason = "直近3発話に対象語の一致なし";
-          instructedEvidence = utterances.map((u) => ({
+          // REQ-701: 「探して見つからなかった」を「指示されていない」と断定しない。
+          // 探索範囲の完全性・言い換え・同意表現の解決を保証できないため判定不能とする。
+          // ただし「探したが検出できなかった」という観測はレビュー優先度の材料として残す
+          instructedReason = `探索範囲内に明示指示を検出できず(探索: 同一セッションの編集前user発話${utterances.length}件)`;
+          instructedObservation = "no_match_in_scope";
+          instructedEvidence = utterances.slice(0, 3).map((u) => ({
             type: "transcript" as const,
             path: u.path,
             line: u.line,
@@ -151,10 +226,21 @@ export function emitClaimsForHunk(ws: Workspace, db: Sqlite.Database, input: Cla
   if (specCount === 0) {
     specReason = "照合先の仕様書が未登録";
   } else if (hit && hit.req_id) {
-    specValue = "支持";
-    specConf = HEURISTIC_CONF_MAX;
-    specReason = `仕様${hit.req_id}(${hit.heading})に関連語が一致`;
-    specEvidence = [{ type: "spec", file: hit.file, req_id: hit.req_id, section: hit.section }];
+    // REQ-704: FTSヒットは候補抽出まで。段落本文にhunkの対象が現れない一致は「支持」にしない。
+    // 「既存テストが通ること」のような一般的要求に技術名が含まれるだけで紐づくのを防ぐ
+    const paragraph = specParagraph(ws, hit.section) ?? "";
+    const targets = hunkTargets(input.file, input.hunk);
+    const bodyHits = [...targets.symbols, ...targets.fileNames].filter(
+      (t) => t && t.length >= 4 && paragraph.toLowerCase().includes(t),
+    );
+    if (bodyHits.length > 0) {
+      specValue = "支持";
+      specConf = HEURISTIC_CONF_MAX;
+      specReason = `仕様${hit.req_id}(${hit.heading})の本文が変更対象(${bodyHits.slice(0, 3).join(", ")})に言及`;
+      specEvidence = [{ type: "spec", file: hit.file, req_id: hit.req_id, section: hit.section }];
+    } else {
+      specReason = `候補仕様${hit.req_id}は見つかったが、本文に変更対象への言及がない(関連語一致のみ)`;
+    }
   } else {
     // ヒットなし/req_idなし段落トップ → 判定不能(「記載なし」と断定しない=v0.3)
     specReason = hit ? "req_id付き仕様段落へのヒットなし" : "仕様検索にヒットなし";
@@ -194,10 +280,12 @@ export function emitClaimsForHunk(ws: Workspace, db: Sqlite.Database, input: Cla
       necConf = 0;
       necReason = "整形のみだが根拠イベントがない";
     }
-  } else if (instructedValue === "なし") {
+  } else if (instructedObservation === "no_match_in_scope") {
+    // 「指示がなかった」の断定ではなく、「探索範囲内に見つからなかった」という観測に基づく
+    // レビュー優先度シグナル(REQ-701)。confidenceは断定より低く置く
     necValue = "unsolicited候補";
-    necConf = 0.4;
-    necReason = `明示指示なし+仕様支持${specValue === INDETERMINATE ? "判定不能" : "なし"}(判定不能由来の低confidence推定)`;
+    necConf = 0.3;
+    necReason = `探索範囲内に明示指示を検出できず+仕様支持${specValue === INDETERMINATE ? "判定不能" : "なし"}(観測に基づく優先度シグナルであり、指示がなかったことの断定ではない)`;
     necEvidence = instructedEvidence.length
       ? instructedEvidence
       : linkedEvents.map((e) => ({ type: "edit_event" as const, operation_id: e.operationId }));

@@ -431,3 +431,104 @@ describe("claim証拠の強化(REQ-601/602/604)", () => {
     expect(diff).toContain("行省略");
   });
 });
+
+describe("claim断定条件の厳格化(REQ-701〜705)", () => {
+  it("REQ-702: 直近3発話より前にある指示でも検出できる", () => {
+    fx = makeRepo({ "src/app.ts": "l1\n" });
+    initProven(fx);
+    const tr = writeTranscript(fx, "s1", [
+      { role: "user", text: "src/app.ts の cacheLayerHandle を buildCacheLayer で初期化して" },
+      { role: "user", text: "ありがとう" },
+      { role: "user", text: "了解です" },
+      { role: "user", text: "続けて" },
+      { role: "user", text: "はい" },
+    ]);
+    capturedEdit(fx, "src/app.ts", "l1\nconst cacheLayerHandle = buildCacheLayer(opts)\n", { transcript: tr });
+    runIngest(fx.ws);
+    const db = openDb(fx.ws);
+    const ins = db.prepare("SELECT value, reason FROM claims WHERE kind='instructed'").get() as {
+      value: string;
+      reason: string;
+    };
+    db.close();
+    expect(ins.value).toBe("あり"); // 4発話前の指示でも見つかる
+  });
+
+  it("REQ-703: 汎用語だけの一致では「あり」にしない", () => {
+    fx = makeRepo({ "src/app.ts": "l1\n" });
+    initProven(fx);
+    const tr = writeTranscript(fx, "s1", [{ role: "user", text: "user の message を type で扱う実装をして" }]);
+    capturedEdit(fx, "src/app.ts", "l1\nconst user = { message: 1, type: 2 }\n", { transcript: tr });
+    runIngest(fx.ws);
+    const db = openDb(fx.ws);
+    const ins = db.prepare("SELECT value FROM claims WHERE kind='instructed'").get() as { value: string };
+    db.close();
+    expect(ins.value).toBe("判定不能"); // user/message/type は汎用語なので対象特定にならない
+  });
+
+  it("REQ-704: 候補仕様が見つかっても本文に対象への言及が無ければ「支持」にしない", () => {
+    fx = makeRepo({
+      "docs/spec.md": "# 仕様\n\nREQ-001 既存の自動テストが全て通ること。テストの期待値を緩めない。",
+      "src/app.ts": "l1\n",
+    });
+    initProven(fx);
+    capturedEdit(fx, "src/app.ts", "l1\nconst distinctSymbolHere = buildSomething()\n");
+    runIngest(fx.ws);
+    const db = openDb(fx.ws);
+    const spec = db.prepare("SELECT value, reason FROM claims WHERE kind='spec_support'").get() as {
+      value: string;
+      reason: string;
+    };
+    db.close();
+    expect(spec.value).toBe("判定不能");
+  });
+
+  it("REQ-704: 仕様本文が変更対象に言及していれば「支持」になる", () => {
+    fx = makeRepo({
+      "docs/spec.md": "# 仕様\n\nREQ-001 cacheLayerHandle を buildCacheLayer で初期化すること。",
+      "src/app.ts": "l1\n",
+    });
+    initProven(fx);
+    capturedEdit(fx, "src/app.ts", "l1\nconst cacheLayerHandle = buildCacheLayer(opts)\n");
+    runIngest(fx.ws);
+    const db = openDb(fx.ws);
+    const spec = db.prepare("SELECT value, reason FROM claims WHERE kind='spec_support'").get() as {
+      value: string;
+      reason: string;
+    };
+    db.close();
+    expect(spec.value).toBe("支持");
+    expect(spec.reason).toContain("変更対象");
+  });
+
+  it("REQ-705: 断定precisionと判定不能の妥当率を分けて集計する", () => {
+    const { claimIds } = scenario();
+    const db0 = openDb(fx.ws);
+    const vals = db0
+      .prepare("SELECT claim_id, value FROM claims WHERE kind IN ('instructed','spec_support')")
+      .all() as { claim_id: string; value: string }[];
+    db0.close();
+    const determinate = vals.filter((v) => v.value !== "判定不能").map((v) => v.claim_id);
+    const abstained = vals.filter((v) => v.value === "判定不能").map((v) => v.claim_id);
+    expect(claimIds.length).toBeGreaterThan(0);
+
+    // 断定は全て誤り、判定不能は全て妥当、という状況を作る
+    submitJudgments(
+      fx.ws,
+      "claims",
+      writeJudgments([
+        ...determinate.map((id) => ({ case_id: id, verdict: "incorrect" })),
+        ...abstained.map((id) => ({ case_id: id, verdict: "correct" })),
+      ]),
+      { judge: "human", actorId: "akita" },
+    );
+    const r = reportEval(fx.ws, "claims");
+    expect(r.claimBreakdown).toBeDefined();
+    if (determinate.length > 0) {
+      expect(r.claimBreakdown!.determinatePrecision).toContain("0.0%"); // 断定は全滅
+      expect(r.acceptancePassed).toBe(false); // 判定不能の正しさで救われない
+    }
+    expect(r.claimBreakdown!.abstentionAccuracy).toContain("100.0%");
+    expect(r.lines.join("\n")).toContain("断定precision");
+  });
+});

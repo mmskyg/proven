@@ -313,9 +313,13 @@ describe("claims(N-26〜N-30 / E-30〜E-32)", () => {
   it("N-30: 指示なし+仕様判定不能→unsolicited候補(判定不能由来をreasonに明記)", () => {
     const claims = setup(null, "全然関係ない雑談です", "line1\nline2\nline3\nSURPRISE()\n");
     const ins = claims.find((c) => c.kind === "instructed")!;
-    expect(ins.value).toBe("なし"); // v0.3境界: 3発話一致ゼロ→なし
+    // REQ-701: 「探して見つからなかった」を「指示なし」と断定しない→判定不能
+    expect(ins.value).toBe("判定不能");
+    expect(ins.reason).toContain("探索範囲内に明示指示を検出できず");
     const nec = claims.find((c) => c.kind === "necessity")!;
+    // 断定はしないが、観測に基づくレビュー優先度シグナルは残す
     expect(nec.value).toBe("unsolicited候補");
+    expect(nec.reason).toContain("断定ではない");
     expect(nec.reason).toContain("判定不能");
   });
 
@@ -374,15 +378,20 @@ describe("日本語トークン化(ドッグフーディングで発見した誤
     expect(ins.value).toBe("あり");
   });
 
-  it("無関係な日本語発話では「なし」のまま(過剰一致していない)", () => {
+  it("無関係な日本語発話では断定しない(過剰一致していない)", () => {
     fx = makeRepo({ "src/app.ts": "l1\nl2\n" });
     initProven(fx);
     const tr = writeTranscript(fx, "s1", [{ role: "user", text: "今日の天気はどうですか" }]);
     capturedEdit(fx, "src/app.ts", "l1\nl2\nconst cacheLayer = init()\n", { transcript: tr });
     runIngest(fx.ws);
     const db = openDb(fx.ws);
-    const ins = db.prepare("SELECT value FROM claims WHERE kind='instructed'").get() as { value: string };
+    const ins = db.prepare("SELECT value, reason FROM claims WHERE kind='instructed'").get() as {
+      value: string;
+      reason: string;
+    };
     db.close();
-    expect(ins.value).toBe("なし");
+    // REQ-701: 過剰一致していないことは変わらないが、値は「なし」ではなく判定不能になる
+    expect(ins.value).toBe("判定不能");
+    expect(ins.reason).toContain("探索範囲内に明示指示を検出できず");
   });
 });

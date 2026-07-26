@@ -32,6 +32,8 @@ export interface EvalCasePack {
   generated_from: { base_revision_ref: string; head_revision_ref: string };
   population: number;
   sampled: number;
+  /** 無作為抽出の種(REQ-607)。同じ母集団・同じ種なら同じ標本になる */
+  sample_seed: string;
   rubric: string[]; // 判定基準(AIが迷わないように明文化)
   output_contract: Record<string, unknown>; // 返してほしいJSONの形
   cases: EvalCase[];
@@ -75,6 +77,36 @@ const OUTPUT_CONTRACT = {
   },
   note: "cases配列と同じcase_idで返してください。判定できないものはunsureにし、省略しないでください。",
 };
+
+/**
+ * 決定的な無作為抽出(REQ-607)。
+ * 先頭N件では時期が偏り、母集団を代表しない標本になる(実際に、先頭20件が
+ * 全て同一時期の「判定不能」で埋まった)。種を記録して再現可能にする。
+ */
+function sampleRows<T>(rows: T[], sample: number, seed: string): T[] {
+  if (rows.length <= sample) return rows;
+  let h = 2166136261;
+  for (let i = 0; i < seed.length; i++) {
+    h ^= seed.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  const rand = (): number => {
+    h += 0x6d2b79f5;
+    let t = h;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+  const idx = rows.map((_, i) => i);
+  for (let i = idx.length - 1; i > 0; i--) {
+    const j = Math.floor(rand() * (i + 1));
+    [idx[i], idx[j]] = [idx[j], idx[i]];
+  }
+  return idx
+    .slice(0, sample)
+    .sort((a, b) => a - b)
+    .map((i) => rows[i]);
+}
 
 interface HunkRow {
   hunk_instance_id: string;
@@ -306,7 +338,7 @@ export function buildCasePack(ws: Workspace, kind: EvalKind, sample: number): Ev
         )
         .all() as HunkRow[];
       population = rows.length;
-      for (const h of rows.slice(0, Math.min(sample, rows.length))) {
+      for (const h of sampleRows(rows, sample, latest.job_id)) {
         // 1操作N ファイルに対応するため、イベントは (operation_id, file) で絞る
         const links = db
           .prepare(
@@ -412,7 +444,7 @@ export function buildCasePack(ws: Workspace, kind: EvalKind, sample: number): Ev
         ingest_job_id: string | null;
       })[];
       population = rows.length;
-      for (const c of rows.slice(0, Math.min(sample, rows.length))) {
+      for (const c of sampleRows(rows, sample, latest.job_id)) {
         const evidence = JSON.parse(c.evidence_json) as { type: string; [k: string]: unknown }[];
         const materialized = evidence.map((ev) => {
           if (ev.type === "transcript") {
@@ -467,6 +499,7 @@ export function buildCasePack(ws: Workspace, kind: EvalKind, sample: number): Ev
       generated_from: { base_revision_ref: latest.base_revision_ref, head_revision_ref: latest.head_revision_ref },
       population,
       sampled: cases.length,
+      sample_seed: latest.job_id,
       rubric: kind === "lineage" ? LINEAGE_RUBRIC : CLAIMS_RUBRIC,
       output_contract: OUTPUT_CONTRACT,
       cases,
