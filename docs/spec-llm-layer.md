@@ -123,8 +123,25 @@ Claude Code 自体の非対話利用は許諾されていると読める。た�
 `codex exec` を**繰り返し実行するワークフロー・パイプラインから呼ぶこと**が公式に案内されており、
 ChatGPTアカウントでのサインインが標準の認証方法として示されている。
 
-**結論**: 曖昧さの小さい順に、①公式APIキー（既定）②Codex CLI の順とする。
-Anthropic のCLIをバックエンドに使う経路は**提供しない**（規約上の位置づけを断定できないため）。
+**OpenClaw の実装（同種の問題を先に解いている先行事例）**（https://docs.openclaw.ai/concepts/oauth）:
+
+- サブスクリプション認証をOAuthで扱うのは **OpenAI Codex (ChatGPT OAuth)** と **Anthropic Claude CLI の再利用**
+- ただし **「For Anthropic in production, API key auth is still the safer recommended path.」**
+- Claude のサブスクリプションを使う場合は、CLIを叩くのではなく **`claude setup-token`** で
+  長期トークンを作り、それを認証情報として渡す
+- 規約面は「Anthropic のスタッフから許諾を確認した」という**ベンダー側の明示**に依拠しており、
+  自己解釈で押し切っていない
+
+**結論**: 次の順で扱う。
+
+1. **公式APIキー（既定）** — 曖昧さがない
+2. **`claude setup-token` で作った長期トークン** — Anthropic公式の仕組み。`ANTHROPIC_AUTH_TOKEN` として
+   渡せば既存のプロバイダがそのまま使える（CLIを叩く経路は不要）
+3. **Codex CLI** — OpenAIがパイプライン利用を明示している
+
+REQ-819: Anthropic のサブスクリプションを使いたい利用者には、**CLIを自動実行させるのではなく
+`claude setup-token` で作ったトークンを環境変数で渡す**手順を案内する。
+CLIをバックエンドとして叩く経路は実装しない。
 
 REQ-818: **既定プロバイダは公式APIキー方式（`anthropic`）とする。**
 CLI方式は明示的に設定した場合のみ有効とし、ドキュメントに次を明記する。

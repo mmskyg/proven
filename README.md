@@ -89,7 +89,9 @@ Node.js 20以上。SQLiteのネイティブモジュール(better-sqlite3)をビ
 - **LLMプロバイダ**: 既定は公式APIキー方式(`anthropic`)です。Anthropicの消費者向け規約は、
   自動化・スクリプト経由のアクセスを「APIキー経由、または明示的に許諾された場合」に限っているため、
   **サブスクリプション認証のCLIをバックエンドに使う経路は提供していません**。
-  APIキーを持たない場合の選択肢として、`codex exec` をパイプラインから呼ぶことを公式に案内している
+  Claudeのサブスクリプションを使いたい場合は、CLIを自動実行させるのではなく
+  `claude setup-token` で長期トークンを作り、`ANTHROPIC_AUTH_TOKEN` として渡してください(Anthropic公式の仕組みです)。
+  APIキーもトークンも用意しない場合の選択肢として、`codex exec` をパイプラインから呼ぶことを公式に案内している
   Codex CLI(`proven config llm.provider codex-cli`)を選べます。いずれの場合も、
   ご自身の契約条件の確認は利用者側の責任です。
 - **Phase 2以降の全機能**: レビューTUI(`review`)、検証バッテリー(`verify`)、承認記録(`attest`)、ルール学習(`learn`)、文体lint(`docstyle`)、メトリクス(`report`)は未着手です。
