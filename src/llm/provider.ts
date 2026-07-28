@@ -119,6 +119,31 @@ export function parseJsonLoose(text: string): Record<string, unknown> | null {
   }
 }
 
+/** CLI起動のタイムアウト(ms)。ハングしても1件で止まるようにする */
+const CLI_TIMEOUT_MS = 600_000;
+
+/**
+ * 子プロセスをstdinを与えずに起動する。
+ * `codex exec` はstdinがパイプだと入力を`<stdin>`ブロックとして読むためEOFまでブロックする。
+ * execFileはstdioを常にパイプにするので、spawnで明示的に stdin を閉じる必要がある。
+ */
+async function spawnNoStdin(command: string, args: string[], timeoutMs: number): Promise<void> {
+  const { spawn } = await import("node:child_process");
+  await new Promise<void>((resolve, reject) => {
+    const child = spawn(command, args, { stdio: ["ignore", "ignore", "ignore"] });
+    const timer = setTimeout(() => child.kill("SIGKILL"), timeoutMs);
+    child.on("error", (e) => {
+      clearTimeout(timer);
+      reject(e);
+    });
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      if (code === 0) resolve();
+      else reject(new Error(`${command} exited with ${String(code)}`));
+    });
+  });
+}
+
 /**
  * ローカルの `codex` CLI をプロバイダとして使う(REQ-818)。
  * 認証はCodex CLI側の設定に従う。サンドボックスは read-only で起動し、
@@ -129,17 +154,14 @@ export function codexCliProvider(): LlmProvider {
     name: "codex-cli",
     async complete(req: LlmRequest): Promise<LlmResponse | null> {
       try {
-        const { execFile } = await import("node:child_process");
-        const { promisify } = await import("node:util");
         const os = await import("node:os");
         const fs = await import("node:fs");
         const path = await import("node:path");
-        const run = promisify(execFile);
         const dir = fs.mkdtempSync(path.join(os.tmpdir(), "proven-codex-"));
         const out = path.join(dir, "last.txt");
         const prompt = `${req.system}\n\n${req.user}\n\n出力はJSONのみ。スキーマ: ${JSON.stringify(req.schema)}`;
         try {
-          await run(
+          await spawnNoStdin(
             "codex",
             [
               "exec",
@@ -157,7 +179,7 @@ export function codexCliProvider(): LlmProvider {
               out,
               prompt,
             ],
-            { maxBuffer: 10 * 1024 * 1024, timeout: 600_000 },
+            CLI_TIMEOUT_MS,
           );
           const text = fs.existsSync(out) ? fs.readFileSync(out, "utf8") : "";
           return { parsed: parseJsonLoose(text), usage: { inputTokens: 0, outputTokens: 0 }, model: req.model };

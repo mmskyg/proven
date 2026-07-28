@@ -1,6 +1,7 @@
 // 対象: LLM第二段判定(docs/spec-llm-layer.md REQ-801〜816)
 // ネットワークは一切使わない。モックプロバイダを注入する。
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { runLlmJudge } from "../src/llm/run.js";
@@ -267,5 +268,67 @@ describe("プロバイダ出力のパース(REQ-818)", () => {
       value: "判定不能",
     });
     expect(parseJsonLoose("JSONではない出力")).toBeNull();
+  });
+});
+
+describe("codex-cli プロバイダの起動(REQ-817)", () => {
+  /** PATHの先頭に置く `codex` スタブ。stdinがパイプなら出力を書かずに終わる */
+  function stubCodex(): string {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "proven-stub-"));
+    const p = path.join(dir, "codex");
+    fs.writeFileSync(
+      p,
+      [
+        "#!/usr/bin/env node",
+        'const fs = require("node:fs");',
+        // 本物の codex exec は stdin がパイプ(execFileではsocket)だと <stdin> として読むため
+        // EOFまでブロックする。stdinを閉じた場合だけ /dev/null = character device になる。
+        // ここではブロックの代わりに何も書かずに終え、回帰を parsed=null として検出する
+        "if (!fs.fstatSync(0).isCharacterDevice()) process.exit(3);",
+        'const i = process.argv.indexOf("-o");',
+        'fs.writeFileSync(process.argv[i + 1], \'```json\\n{"value":"あり"}\\n```\');',
+      ].join("\n"),
+      { mode: 0o755 },
+    );
+    return dir;
+  }
+
+  it("stdinをパイプにせず起動し、-o の出力からJSONを取り出す", async () => {
+    const stubDir = stubCodex();
+    const savedPath = process.env.PATH;
+    process.env.PATH = `${stubDir}${path.delimiter}${savedPath ?? ""}`;
+    try {
+      const { codexCliProvider } = await import("../src/llm/provider.js");
+      const res = await codexCliProvider().complete({
+        system: "s",
+        user: "u",
+        schema: { type: "object" },
+        model: "stub-model",
+      });
+      expect(res?.parsed).toEqual({ value: "あり" });
+      expect(res?.model).toBe("stub-model");
+    } finally {
+      process.env.PATH = savedPath;
+      fs.rmSync(stubDir, { recursive: true, force: true });
+    }
+  });
+
+  it("CLIが見つからない場合はエラーにせずnullを返す(REQ-816)", async () => {
+    const emptyDir = fs.mkdtempSync(path.join(os.tmpdir(), "proven-nopath-"));
+    const savedPath = process.env.PATH;
+    process.env.PATH = emptyDir;
+    try {
+      const { codexCliProvider } = await import("../src/llm/provider.js");
+      const res = await codexCliProvider().complete({
+        system: "s",
+        user: "u",
+        schema: { type: "object" },
+        model: "stub-model",
+      });
+      expect(res).toBeNull();
+    } finally {
+      process.env.PATH = savedPath;
+      fs.rmSync(emptyDir, { recursive: true, force: true });
+    }
   });
 });
