@@ -343,7 +343,8 @@ program
       emitResult(ctx, "llm-judge", "ok", r, [
         r.enabled
           ? `LLM判定: 対象${r.targets}件 / 判定${r.judged}件 (断定${r.determinate} / 破棄${r.discarded}) ` +
-            `呼び出し${r.calls}回 / 概算$${r.spentUsd}`
+            `呼び出し${r.calls}回 / トークン in ${r.inputTokens} + out ${r.outputTokens} / ` +
+            (r.spentUsd > 0 ? `概算$${r.spentUsd}` : "費用は金額換算なし")
           : "LLM層は無効です",
       ]);
     } catch (e) {

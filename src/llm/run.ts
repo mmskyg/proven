@@ -23,6 +23,9 @@ export interface LlmRunSummary {
   skippedByBudget: number;
   calls: number;
   spentUsd: number;
+  /** 実際に使ったトークン数(プロバイダが返さない場合は0) */
+  inputTokens: number;
+  outputTokens: number;
   warnings: string[];
 }
 
@@ -73,6 +76,8 @@ export async function runLlmJudge(
     skippedByBudget: 0,
     calls: 0,
     spentUsd: 0,
+    inputTokens: 0,
+    outputTokens: 0,
     warnings,
   };
   if (!cfg.llm.enabled) {
@@ -89,6 +94,13 @@ export async function runLlmJudge(
         "`proven config llm.provider codex-cli` などローカルCLIを使ってください)",
     );
     return empty;
+  }
+  if (useCli) {
+    // CLI方式は単価が分からず金額換算できない。効くのは回数上限だけであることを明示する
+    warnings.push(
+      `CLI方式(${cfg.llm.provider})では費用上限(budget_usd_per_run)は効きません。` +
+        `回数上限(max_calls_per_run=${cfg.llm.max_calls_per_run})で制御します`,
+    );
   }
   const model = cfg.llm.model_light || "claude-opus-5";
 
@@ -199,6 +211,8 @@ export async function runLlmJudge(
       skippedByBudget: budget.skipped,
       calls: budget.calls,
       spentUsd: Number(budget.spentUsd.toFixed(4)),
+      inputTokens: budget.inputTokens,
+      outputTokens: budget.outputTokens,
       warnings,
     };
   } finally {

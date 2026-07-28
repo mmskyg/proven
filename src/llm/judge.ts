@@ -93,12 +93,15 @@ export interface JudgeBudget {
   budgetUsd: number;
   calls: number;
   spentUsd: number;
+  /** 実際に使ったトークン数(プロバイダが返した場合のみ) */
+  inputTokens: number;
+  outputTokens: number;
   /** 上限で打ち切った件数(警告用) */
   skipped: number;
 }
 
 export function newBudget(maxCalls: number, budgetUsd: number): JudgeBudget {
-  return { maxCalls, budgetUsd, calls: 0, spentUsd: 0, skipped: 0 };
+  return { maxCalls, budgetUsd, calls: 0, spentUsd: 0, inputTokens: 0, outputTokens: 0, skipped: 0 };
 }
 
 export function budgetExhausted(b: JudgeBudget): boolean {
@@ -125,6 +128,8 @@ export async function judge(
   budget.calls++;
   if (!res) return null;
   budget.spentUsd += res.costUsdOverride ?? estimateCostUsd(res.model, res.usage);
+  budget.inputTokens += res.usage.inputTokens;
+  budget.outputTokens += res.usage.outputTokens;
   if (!res.parsed) return null;
 
   const p = res.parsed;

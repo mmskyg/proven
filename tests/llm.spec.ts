@@ -287,6 +287,9 @@ describe("codex-cli プロバイダの起動(REQ-817)", () => {
         "if (!fs.fstatSync(0).isCharacterDevice()) process.exit(3);",
         'const i = process.argv.indexOf("-o");',
         'fs.writeFileSync(process.argv[i + 1], \'```json\\n{"value":"あり"}\\n```\');',
+        // `codex exec --json` 相当のイベント列(使用トークン数はここから取る)
+        'process.stdout.write(JSON.stringify({ type: "thread.started", thread_id: "t1" }) + "\\n");',
+        'process.stdout.write(JSON.stringify({ type: "turn.completed", usage: { input_tokens: 1200, cached_input_tokens: 0, output_tokens: 30, reasoning_output_tokens: 7 } }) + "\\n");',
       ].join("\n"),
       { mode: 0o755 },
     );
@@ -307,10 +310,29 @@ describe("codex-cli プロバイダの起動(REQ-817)", () => {
       });
       expect(res?.parsed).toEqual({ value: "あり" });
       expect(res?.model).toBe("stub-model");
+      // 使用トークン数はイベント列から取れる(reasoningは出力に合算)
+      expect(res?.usage).toEqual({ inputTokens: 1200, outputTokens: 37 });
+      // 単価が分からないので金額換算はしない(費用上限は効かない)
+      expect(res?.costUsdOverride).toBe(0);
     } finally {
       process.env.PATH = savedPath;
       fs.rmSync(stubDir, { recursive: true, force: true });
     }
+  });
+
+  it("イベント列が壊れていても使用トークン数の解析で落ちない", async () => {
+    const { parseCodexUsage } = await import("../src/llm/provider.js");
+    expect(parseCodexUsage("")).toEqual({ inputTokens: 0, outputTokens: 0 });
+    expect(parseCodexUsage('壊れた行\n{"usage":\n{"type":"turn.completed"}')).toEqual({
+      inputTokens: 0,
+      outputTokens: 0,
+    });
+    // 複数ターンなら足し合わせる
+    const jsonl = [
+      JSON.stringify({ type: "turn.completed", usage: { input_tokens: 10, output_tokens: 2 } }),
+      JSON.stringify({ type: "turn.completed", usage: { input_tokens: 5, output_tokens: 1, reasoning_output_tokens: 3 } }),
+    ].join("\n");
+    expect(parseCodexUsage(jsonl)).toEqual({ inputTokens: 15, outputTokens: 6 });
   });
 
   it("CLIが見つからない場合はエラーにせずnullを返す(REQ-816)", async () => {

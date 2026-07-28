@@ -122,26 +122,61 @@ export function parseJsonLoose(text: string): Record<string, unknown> | null {
 /** CLI起動のタイムアウト(ms)。ハングしても1件で止まるようにする */
 const CLI_TIMEOUT_MS = 600_000;
 
+/** stdout取り込みの上限(byte)。イベント列が想定外に長くても止まらないようにする */
+const CLI_MAX_STDOUT = 10 * 1024 * 1024;
+
 /**
- * 子プロセスをstdinを与えずに起動する。
+ * 子プロセスをstdinを与えずに起動し、stdoutを返す。
  * `codex exec` はstdinがパイプだと入力を`<stdin>`ブロックとして読むためEOFまでブロックする。
  * execFileはstdioを常にパイプにするので、spawnで明示的に stdin を閉じる必要がある。
  */
-async function spawnNoStdin(command: string, args: string[], timeoutMs: number): Promise<void> {
+async function spawnNoStdin(command: string, args: string[], timeoutMs: number): Promise<string> {
   const { spawn } = await import("node:child_process");
-  await new Promise<void>((resolve, reject) => {
-    const child = spawn(command, args, { stdio: ["ignore", "ignore", "ignore"] });
+  return await new Promise<string>((resolve, reject) => {
+    const child = spawn(command, args, { stdio: ["ignore", "pipe", "ignore"] });
+    let stdout = "";
     const timer = setTimeout(() => child.kill("SIGKILL"), timeoutMs);
+    child.stdout.setEncoding("utf8");
+    child.stdout.on("data", (chunk: string) => {
+      if (stdout.length < CLI_MAX_STDOUT) stdout += chunk;
+    });
     child.on("error", (e) => {
       clearTimeout(timer);
       reject(e);
     });
     child.on("close", (code) => {
       clearTimeout(timer);
-      if (code === 0) resolve();
+      if (code === 0) resolve(stdout);
       else reject(new Error(`${command} exited with ${String(code)}`));
     });
   });
+}
+
+/**
+ * `codex exec --json` のイベント列(JSONL)から使用トークン数を取り出す。
+ * 取れなかった場合は0を返す(判定自体は続行する)。
+ * reasoning_output_tokensは出力側に合算する(課金上も出力として扱われるため)。
+ */
+export function parseCodexUsage(stdoutJsonl: string): { inputTokens: number; outputTokens: number } {
+  let inputTokens = 0;
+  let outputTokens = 0;
+  for (const line of stdoutJsonl.split("\n")) {
+    const t = line.trim();
+    if (!t.startsWith("{") || !t.includes('"usage"')) continue;
+    let ev: { usage?: Record<string, unknown> };
+    try {
+      ev = JSON.parse(t) as { usage?: Record<string, unknown> };
+    } catch {
+      continue;
+    }
+    const u = ev.usage;
+    if (!u) continue;
+    const num = (k: string): number => (typeof u[k] === "number" ? (u[k] as number) : 0);
+    // turn.completed は累積ではなくターンごとなので、複数ターンなら足し合わせる
+    inputTokens += num("input_tokens");
+    outputTokens += num("output_tokens") + num("reasoning_output_tokens");
+  }
+  return { inputTokens, outputTokens };
 }
 
 /**
@@ -161,10 +196,12 @@ export function codexCliProvider(): LlmProvider {
         const out = path.join(dir, "last.txt");
         const prompt = `${req.system}\n\n${req.user}\n\n出力はJSONのみ。スキーマ: ${JSON.stringify(req.schema)}`;
         try {
-          await spawnNoStdin(
+          const stdout = await spawnNoStdin(
             "codex",
             [
               "exec",
+              // 使用トークン数を取るためイベントをJSONLで受ける(最終メッセージは -o から読む)
+              "--json",
               "--sandbox",
               "read-only",
               "--skip-git-repo-check",
@@ -182,7 +219,14 @@ export function codexCliProvider(): LlmProvider {
             CLI_TIMEOUT_MS,
           );
           const text = fs.existsSync(out) ? fs.readFileSync(out, "utf8") : "";
-          return { parsed: parseJsonLoose(text), usage: { inputTokens: 0, outputTokens: 0 }, model: req.model };
+          return {
+            parsed: parseJsonLoose(text),
+            usage: parseCodexUsage(stdout),
+            model: req.model,
+            // 費用はCLI側の契約(サブスクリプション等)に依存し、単価が分からない。
+            // Anthropicの単価表で概算すると誤った金額になるため0とする(費用上限は効かない)
+            costUsdOverride: 0,
+          };
         } finally {
           fs.rmSync(dir, { recursive: true, force: true });
         }
