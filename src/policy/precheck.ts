@@ -3,6 +3,7 @@ import path from "node:path";
 import { ulid } from "ulid";
 import { ProvenError } from "../shared/errors.js";
 import { loadConfig, matchAnyGlob } from "../shared/config.js";
+import { formatPendingDecision, pendingDecisions } from "../shared/decisions.js";
 import type { Finding } from "../shared/types.js";
 import { appendEvent } from "../store/events.js";
 import { applyEvent, openDbChecked } from "../store/projections.js";
@@ -199,6 +200,10 @@ export function runPrecheck(ws: Workspace, opts: { skipIngest?: boolean } = {}):
 
     // 5. PR説明下書き生成
     const prDraftPath = writePrDraft(ws, latest, unsRows, expectations, ingestSummary);
+
+    // 決めていない設定のまま「レビューしてください」に進むのを止めない代わりに、必ず読み上げる(REQ-823)。
+    // 未決の影響は失敗ではなく判定精度の低下として出るので、黙っていると気づけない。
+    for (const d of pendingDecisions(ws)) warnings.push(formatPendingDecision(d));
 
     // 6. gate判定: fresh∧open∧fail∧tool-confirmed∧block(新規・悪化のanti_patternsのみ)
     const gate = findings.some(

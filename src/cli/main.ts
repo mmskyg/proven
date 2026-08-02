@@ -76,7 +76,8 @@ program
   .description("プロジェクト初期化(F-01)")
   .option("--yes", "非対話で既定値を使用", false)
   .option("--agent <ids>", "登録するハーネスをカンマ区切りで明示(既定: 検出した全て)")
-  .action((opts: { yes: boolean; agent?: string }) => {
+  .option("--global", "claude-codeのhookをユーザー全体設定に登録する(リポジトリ外で起動したセッションからでも捕捉される)", false)
+  .action((opts: { yes: boolean; agent?: string; global?: boolean }) => {
     const ctx: OutputCtx = { json: false, warnings: [] };
     try {
       const ws = workspace(process.cwd());
@@ -86,7 +87,12 @@ program
             .map((s) => s.trim())
             .filter(Boolean)
         : undefined;
-      const r = runInit(ws, { yes: opts.yes, isTTY: process.stdout.isTTY ?? false, agents });
+      const r = runInit(ws, {
+        yes: opts.yes,
+        isTTY: process.stdout.isTTY ?? false,
+        agents,
+        global: opts.global === true,
+      });
       emitResult(ctx, "init", "ok", r, [
         r.created ? ".proven/ を作成しました" : ".proven/ は既に存在します(再初期化)",
         ...r.messages,

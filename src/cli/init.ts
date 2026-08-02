@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { ProvenError } from "../shared/errors.js";
 import { defaultConfig, saveConfig } from "../shared/config.js";
+import { formatPendingDecision, pendingDecisions } from "../shared/decisions.js";
 import { buildSpecIndex } from "../spec/index.js";
 import { openDb } from "../store/projections.js";
 import { eventsDir, exportsDir, logsDir, objectsDir, type Workspace } from "../store/paths.js";
@@ -90,7 +91,7 @@ export interface InitResult {
 
 export function runInit(
   ws: Workspace,
-  opts: { yes: boolean; isTTY: boolean; agents?: string[] },
+  opts: { yes: boolean; isTTY: boolean; agents?: string[]; global?: boolean },
 ): InitResult {
   const messages: string[] = [];
   if (!opts.yes && !opts.isTTY) {
@@ -128,7 +129,7 @@ export function runInit(
   for (const agent of targets) {
     switch (agent) {
       case "claude-code":
-        hooksUpdated = registerClaudeCode(ws, messages) || hooksUpdated;
+        hooksUpdated = registerClaudeCode(ws, messages, opts.global === true) || hooksUpdated;
         break;
       case "codex":
         hooksUpdated = registerCodex(ws, messages) || hooksUpdated;
@@ -141,36 +142,69 @@ export function runInit(
     }
   }
 
-  // 仕様書スキャン
+  // 仕様書スキャン。
+  // 「1件も当たらない」と「当たったがREQ-IDが無い」は原因も対処も違うので分けて出す(REQ-821)。
+  // 前者を黙って通すと全hunkが spec=判定不能 になり、それが unsolicited候補 のスコアに
+  // 効くため、設定ミスがそのまま偽陽性の増加として現れる。
   const spec = buildSpecIndex(ws);
-  if (spec.reqIds === 0) {
+  if (spec.files > 0 && spec.reqIds === 0) {
     messages.push(
       "仕様書にREQ-xxx形式のIDが見つかりません。要求にIDを振る運用を推奨します(無IDでも動きますが判定精度が下がります)",
     );
   }
   messages.push("LLM送信は現在OFF。有効化は `proven config llm.enabled true`(初回に送信対象プレビューを表示)");
-  messages.push("レビュー観点の事前定義は `proven policy init`(任意)");
+
+  // 未決の設定は最後にまとめて出す。既定値で動いてしまう分、
+  // 決めたのか決めていないのかが後から見分けられなくなるため(REQ-823)
+  const pending = pendingDecisions(ws);
+  for (const d of pending) messages.push(formatPendingDecision(d));
+  if (pending.length > 0) {
+    messages.push(`未決が${pending.length}件あります。precheck のたびに再掲します`);
+  }
   return { created: firstTime, gitignoreUpdated, hooksUpdated, reqIdsFound: spec.reqIds, messages };
 }
 
 type HookEntry = { matcher?: string; hooks?: { type: string; command: string; timeout?: number }[] };
 
-/** claude-code: .claude/settings.json の PreToolUse/PostToolUse に登録 */
-function registerClaudeCode(ws: Workspace, messages: string[]): boolean {
-  const settingsPath = path.join(ws.repoRoot, ".claude", "settings.json");
+/** claude-code のユーザー全体設定(REQ-820)。リポジトリを問わず読まれる */
+export function globalClaudeSettingsPath(env: NodeJS.ProcessEnv = process.env): string {
+  return path.join(env.CLAUDE_CONFIG_DIR ?? path.join(env.HOME ?? "", ".claude"), "settings.json");
+}
+
+/**
+ * claude-code: PreToolUse/PostToolUse に登録。
+ *
+ * 既定はリポジトリの `.claude/settings.json` だが、**Claude Code はセッション開始時の
+ * cwd の設定しか読まない**。リポジトリ外(例: ホームディレクトリ)で起動したセッションから
+ * このリポジトリを編集した場合、hookは一度も発火せず、それでいてエラーも出ない。
+ * 「捕捉0件」と「変更が無い」が見分けられないのが最も危険なので、
+ * 登録時に必ずその条件を伝え、--global でユーザー全体設定に置く道を用意する(REQ-820)。
+ */
+function registerClaudeCode(ws: Workspace, messages: string[], global: boolean): boolean {
+  const settingsPath = global ? globalClaudeSettingsPath() : path.join(ws.repoRoot, ".claude", "settings.json");
+  const label = global ? settingsPath : ".claude/settings.json";
   let settings: Record<string, unknown> = {};
   if (fs.existsSync(settingsPath)) {
     try {
       settings = JSON.parse(fs.readFileSync(settingsPath, "utf8"));
     } catch {
-      throw new ProvenError("input", `.claude/settings.json が不正なJSONです(上書きせず中断します): ${settingsPath}`);
+      throw new ProvenError("input", `${label} が不正なJSONです(上書きせず中断します): ${settingsPath}`);
     }
   }
   const changed = mergeHooks(settings);
   if (changed) {
     fs.mkdirSync(path.dirname(settingsPath), { recursive: true });
     fs.writeFileSync(settingsPath, JSON.stringify(settings, null, 2) + "\n");
-    messages.push("hooks(PreToolUse/PostToolUse)を登録しました");
+    messages.push(`hooks(PreToolUse/PostToolUse)を登録しました: ${label}`);
+  }
+  if (global) {
+    messages.push("ユーザー全体に登録したので、どのディレクトリで起動したセッションからでも捕捉されます");
+  } else {
+    messages.push(
+      "注意: この登録が効くのは、このリポジトリをcwdにして起動したセッションだけです。" +
+        "別のディレクトリ(ホーム等)で起動したセッションから編集すると、hookは無言で一度も発火しません。" +
+        "そのような使い方をするなら `proven init --global` を実行してください",
+    );
   }
   return changed;
 }

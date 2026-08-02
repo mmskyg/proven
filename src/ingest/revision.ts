@@ -23,9 +23,14 @@ export interface Revision {
   manifest: Manifest;
 }
 
+/** proven自身の管理ファイルか(REQ-822)。追跡対象外だが「除外した」とは数えない */
+function isProvenInternal(rel: string): boolean {
+  return rel === ".proven" || rel.startsWith(".proven/");
+}
+
 function excludedByCapture(ws: Workspace, rel: string): boolean {
   const cfg = loadConfig(ws.provenDir);
-  if (rel === ".proven" || rel.startsWith(".proven/")) return true;
+  if (isProvenInternal(rel)) return true;
   return matchAnyGlob(rel, cfg.capture.exclude);
 }
 
@@ -37,7 +42,10 @@ export function buildWorktreeRevision(ws: Workspace): { rev: Revision; excludedC
   let excludedCount = 0;
   for (const rel of all.sort()) {
     if (excludedByCapture(ws, rel)) {
-      excludedCount++;
+      // .proven/config.yaml はgit管理下に置く運用なので、数えると全リポジトリで
+      // 「exclude対象1件」が永久に出続け、対処のしようがない警告になる(REQ-822)。
+      // 利用者が capture.exclude で意図的に外したものだけを数える。
+      if (!isProvenInternal(rel)) excludedCount++;
       continue;
     }
     const abs = path.join(ws.repoRoot, rel);
