@@ -37,6 +37,36 @@ interface UserUtterance {
 }
 
 /**
+ * 仕様書がそのコードより後に書かれたか(REQ-824)。
+ *
+ * 捕捉済みの編集イベントの時刻だけで判定する(観測第一)。
+ * - true  … 仕様書の最初の編集がコードの最初の編集より後 = 事後の追記
+ * - false … 仕様書の方が先にある = 事前の根拠として使える
+ * - null  … どちらかの編集が捕捉されていない。断定しない
+ *
+ * 判定は段落単位ではなくファイル単位。支持根拠の段落だけを追うのが理想だが、
+ * 段落の作成時刻は保持していないため、説明可能な近似としてファイルの初回編集を使う。
+ * 以前から存在する仕様書に今回追記した場合は「先にあった」と扱う(緩い側に倒す)。
+ */
+function specWrittenAfterCode(db: Sqlite.Database, specFile: string, codeOps: string[]): boolean | null {
+  if (codeOps.length === 0) return null;
+  const holes = codeOps.map(() => "?").join(",");
+  const code = db
+    .prepare(
+      `SELECT MIN(ts_pre) AS first FROM edit_events
+       WHERE operation_id IN (${holes}) AND status='completed' AND ts_pre IS NOT NULL`,
+    )
+    .get(...codeOps) as { first: string | null } | undefined;
+  const spec = db
+    .prepare(
+      "SELECT MIN(ts_pre) AS first FROM edit_events WHERE file=? AND status='completed' AND ts_pre IS NOT NULL",
+    )
+    .get(specFile) as { first: string | null } | undefined;
+  if (!code?.first || !spec?.first) return null;
+  return spec.first > code.first;
+}
+
+/**
  * transcriptからtranscript_line以前の直近user発話を最大3件取得。
  * 形式はハーネスごとに違う(Claude CodeはJSONL / codexはrollout)ため、
  * アダプタのreadUtterancesへ委譲する。未対応ハーネスは空配列(=判定不能へ倒す)。
@@ -235,6 +265,11 @@ export function emitClaimsForHunk(ws: Workspace, db: Sqlite.Database, input: Cla
   // --- spec_support ---
   // REQ-710: 変更行がREQ-IDを明示参照しているなら、その要求だけを見る。
   // FTSの類似検索は別の要求を拾いうるため、明示参照があるときは検索結果を使わない
+  //
+  // REQ-824: 支持と判定する前に、その仕様書がコードより後に書かれていないかを見る。
+  // 後から書いた仕様は「この変更は仕様に沿っている」の根拠にならない。
+  // (実測: 実装を終えてから仕様書を追加しただけで unsolicited候補 が11件→0件になった。
+  //  順序を見ないと、後付けで自分のやったことを何でも正当化できてしまう)
   const specTargets = hunkTargets(input.file, input.hunk);
   const explicitReq = specTargets.reqRefs.map((r) => lookupReq(ws, r)).find((r) => r !== null) ?? null;
   const hit = explicitReq ?? searchSpec(ws, identifiers);
@@ -262,12 +297,23 @@ export function emitClaimsForHunk(ws: Workspace, db: Sqlite.Database, input: Cla
     if (refMismatch) {
       specReason = `変更行は${targets.reqRefs.slice(0, 2).join(", ")}を参照しているが、候補仕様(${hit.req_id})と一致しない`;
     } else if (bodyHits.length > 0) {
-      specValue = "支持";
-      specConf = HEURISTIC_CONF_MAX;
-      specReason = explicitRef
+      const base = explicitRef
         ? `変更行が仕様${hit.req_id}(${hit.heading})を明示参照`
         : `仕様${hit.req_id}(${hit.heading})の本文が変更対象(${bodyHits.slice(0, 3).join(", ")})に言及`;
+      const posthoc = specWrittenAfterCode(db, hit.file, input.events.map((e) => e.operationId));
       specEvidence = [{ type: "spec", file: hit.file, req_id: hit.req_id, section: hit.section }];
+      specConf = HEURISTIC_CONF_MAX;
+      if (posthoc === true) {
+        // 支持にはしない。necessity も essential にならないので unsolicited候補 のまま残る
+        specValue = "事後";
+        specReason = `${base}。ただし ${hit.file} はこの変更より後に書かれており、事前の根拠にならない`;
+      } else if (posthoc === null) {
+        specValue = "支持";
+        specReason = `${base}(仕様書の作成時期は未観測)`;
+      } else {
+        specValue = "支持";
+        specReason = base;
+      }
     } else {
       specReason = `候補仕様${hit.req_id}は見つかったが、本文に変更対象への言及がない(関連語一致のみ)`;
     }
@@ -315,7 +361,13 @@ export function emitClaimsForHunk(ws: Workspace, db: Sqlite.Database, input: Cla
     // レビュー優先度シグナル(REQ-701)。confidenceは断定より低く置く
     necValue = "unsolicited候補";
     necConf = 0.3;
-    necReason = `探索範囲内に明示指示を検出できず+仕様支持${specValue === INDETERMINATE ? "判定不能" : "なし"}(観測に基づく優先度シグナルであり、指示がなかったことの断定ではない)`;
+    // 事後の仕様書は「なし」で片付けず、そう判定した理由まで出す。
+    // 利用者から見ると仕様書は存在するので、黙って「支持なし」だと理由が分からない(REQ-824)
+    const specPhrase =
+      specValue === "事後"
+        ? "仕様書はあるがコードより後に書かれており事前の根拠にならない"
+        : `仕様支持${specValue === INDETERMINATE ? "判定不能" : "なし"}`;
+    necReason = `探索範囲内に明示指示を検出できず+${specPhrase}(観測に基づく優先度シグナルであり、指示がなかったことの断定ではない)`;
     necEvidence = instructedEvidence.length
       ? instructedEvidence
       : linkedEvents.map((e) => ({ type: "edit_event" as const, operation_id: e.operationId }));
