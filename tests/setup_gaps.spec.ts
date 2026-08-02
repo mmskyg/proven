@@ -78,6 +78,15 @@ describe("REQ-823 未決の設定は決め方つきで読み上げる", () => {
     expect(pendingDecisions(fx.ws)).toEqual([]);
   });
 
+  it("spec_sources: [] は『使わないと決めた』表明として警告しない", () => {
+    const fx = repo({ "a.ts": "export const a = 1;\n" });
+    runInit(fx.ws, { yes: true, isTTY: false });
+    const cfg = loadConfig(fx.ws.provenDir);
+    cfg.spec_sources = [];
+    saveConfig(fx.ws.provenDir, cfg);
+    expect(pendingDecisions(fx.ws).map((d) => d.key)).not.toContain("spec_sources");
+  });
+
   it("未決には『何が起きるか』と『決め方』が必ず付く", () => {
     const fx = repo({ "a.ts": "export const a = 1;\n" });
     runInit(fx.ws, { yes: true, isTTY: false });

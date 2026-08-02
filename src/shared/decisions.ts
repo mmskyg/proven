@@ -34,13 +34,16 @@ export function pendingDecisions(ws: Workspace): PendingDecision[] {
     });
   }
 
-  if (specFiles(ws).length === 0) {
+  // spec_sources: [] は「仕様書を使わないと決めた」表明として扱い、警告しない。
+  // 小さなリポジトリでは仕様書を置かない選択が普通にあり、そこで消えない警告を出すと
+  // REQ-822で潰したのと同じ「対処のしようがない警告」を作ってしまうため。
+  if (cfg.spec_sources.length > 0 && specFiles(ws).length === 0) {
     const globs = cfg.spec_sources.map((s) => s.glob).join(", ");
     out.push({
       key: "spec_sources",
       question: `仕様書の置き場(spec_sources)が実態と合っていません。検索パターン ${globs} に1件も当たりません`,
       risk: "全ての変更が spec=判定不能 になり、それが unsolicited候補 のスコアに効くので、頼んでいない変更の判定が甘くなります",
-      howTo: ".proven/config.yaml の spec_sources を実際の仕様書の場所に直す",
+      howTo: ".proven/config.yaml の spec_sources を実際の場所に直す。仕様書を使わないなら spec_sources: [] と明示する",
     });
   }
 
