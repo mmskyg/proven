@@ -9,6 +9,40 @@ function str(v: unknown): string {
   return typeof v === "string" ? v : "";
 }
 
+/**
+ * roleがuserでも「人が言ったこと」ではない行を除く(REQ-827)。
+ *
+ * Claude Codeのtranscriptは、コンパクション要約やCLIコマンドの実行結果も
+ * role=user として書き込む。要約は会話全体の技術用語(ファイル名・識別子・SQL断片)を
+ * 大量に含むため、これを発話として扱うと**ほぼ何にでも一致し**、
+ * 指示が無い変更まで instructed=あり になる。実測でこの誤検出が出た。
+ *
+ * isMeta では弾かない。Discord等のチャネル経由で届いた**本物のユーザー発話にも
+ * isMeta が付く**ため、弾くと指示が丸ごと見えなくなる。
+ */
+function isNonSpeech(obj: Record<string, unknown>, text: string): boolean {
+  if (obj.isCompactSummary === true) return true;
+  // スラッシュコマンドの起動と、その標準出力。人の指示ではない
+  if (/<command-name>|<local-command-stdout>|<local-command-stderr>/.test(text)) return true;
+  return false;
+}
+
+/**
+ * 発話に混ざる伝送メタデータを落とす(REQ-827)。
+ *
+ * チャネル経由の発話は `<channel source="plugin:discord:discord" chat_id="..." ...>` に
+ * 包まれて届く。この属性は**全ての発話に必ず入る固定語**なので、残すと
+ * `discord` `plugin` `source` のような語が毎回タダで一致し、指示の証拠にならない。
+ * 中の本文だけを残す。
+ */
+function stripTransportMarkup(text: string): string {
+  return text
+    .replace(/<channel\b[^>]*>/g, " ")
+    .replace(/<\/channel>/g, " ")
+    .replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, " ")
+    .trim();
+}
+
 /** transcript(Claude Code形式JSONL)からbeforeLine以前の直近user発話を最大max件 */
 export function readClaudeUtterances(sessionRef: string, beforeLine: number | null, max = 3): Utterance[] {
   if (!sessionRef || !fs.existsSync(sessionRef)) return [];
@@ -29,7 +63,9 @@ export function readClaudeUtterances(sessionRef: string, beforeLine: number | nu
             : Array.isArray(content)
               ? content.map((c: { text?: string }) => c?.text ?? "").join(" ")
               : "";
-        if (text.trim()) out.push({ text, line: i + 1, path: sessionRef });
+        if (!text.trim() || isNonSpeech(obj, text)) continue;
+        const speech = stripTransportMarkup(text);
+        if (speech) out.push({ text: speech, line: i + 1, path: sessionRef });
       }
     } catch {
       continue;

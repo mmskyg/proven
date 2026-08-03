@@ -1,7 +1,11 @@
-// 対象: 後から書いた仕様書を事前の根拠に数えない(docs/spec-setup-gaps.md REQ-824)
+// 対象: 後から書いた仕様書を事前の根拠に数えない / 発話でない行を指示に数えない
+//       (docs/spec-setup-gaps.md REQ-824/826/827)
+import fs from "node:fs";
+import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { runIngest } from "../src/ingest/ingest.js";
 import { runTriage } from "../src/triage/triage.js";
+import { readClaudeUtterances } from "../src/agents/claudeCode.js";
 import { openDb } from "../src/store/projections.js";
 import { capturedEdit, cleanup, initProven, makeRepo, writeTranscript, type Fixture } from "./helpers.js";
 
@@ -144,5 +148,39 @@ describe("REQ-824 仕様書がコードより後なら事後として区別す�
 
     // ファイルの初回編集はコードより前なので 支持。段落単位で追わない近似の帰結
     expect(specClaim(fx, "src/app.ts").value).toBe("支持");
+  });
+});
+
+describe("REQ-827 role=userでも人の発話でない行は指示として読まない", () => {
+  it("コンパクション要約とスラッシュコマンド出力を除き、チャネル経由の発話は残す", () => {
+    const fx = repo({ "a.ts": "x\n" });
+    const p = path.join(fx.transcriptDir, "t.jsonl");
+    fs.writeFileSync(
+      p,
+      [
+        // 本物の発話(Discord経由。isMetaが付くが人の指示)
+        JSON.stringify({
+          isMeta: true,
+          message: {
+            role: "user",
+            content: '<channel source="plugin:discord:discord" chat_id="1" user="akita">READMEを直して</channel>',
+          },
+        }),
+        // コンパクション要約(機械が書いた要約。技術用語だらけ)
+        JSON.stringify({
+          isCompactSummary: true,
+          message: { role: "user", content: "This session is being continued... sqlite database filter" },
+        }),
+        // スラッシュコマンドの実行と出力
+        JSON.stringify({ message: { role: "user", content: "<command-name>/compact</command-name>" } }),
+        JSON.stringify({ message: { role: "user", content: "<local-command-stdout>Compacted</local-command-stdout>" } }),
+      ].join("\n") + "\n",
+    );
+    const got = readClaudeUtterances(p, null, 10).map((u) => u.text);
+    expect(got).toHaveLength(1);
+    expect(got[0]).toContain("READMEを直して");
+    // 伝送メタデータ(全発話に必ず入る固定語)は本文として残さない
+    expect(got[0]).not.toContain("discord");
+    expect(got[0]).not.toContain("<channel");
   });
 });
