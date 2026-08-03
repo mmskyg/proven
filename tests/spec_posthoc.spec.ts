@@ -23,6 +23,21 @@ function tick(): void {
   }
 }
 
+function specClaims(fx: Fixture, file: string): { value: string; reason: string }[] {
+  const db = openDb(fx.ws);
+  try {
+    return db
+      .prepare(
+        `SELECT c.value AS value, c.reason AS reason
+           FROM claims c JOIN hunks h ON h.hunk_instance_id = c.hunk_ref
+          WHERE c.kind='spec_support' AND h.file=?`,
+      )
+      .all(file) as { value: string; reason: string }[];
+  } finally {
+    db.close();
+  }
+}
+
 function specClaim(fx: Fixture, file: string): { value: string; reason: string } {
   const db = openDb(fx.ws);
   try {
@@ -90,6 +105,30 @@ describe("REQ-824 仕様書がコードより後なら事後として区別す�
     const claim = specClaim(fx, "src/app.ts");
     expect(claim.value).toBe("支持");
     expect(claim.reason).toContain("未観測");
+  });
+
+  it("REQ-826: 同じファイルを前から触っていても、仕様書より後に書いた行は事後にしない", () => {
+    // 実測で出た誤判定の再現。READMEのように朝から何度も触るファイルでは、
+    // 「そのファイルの最初の編集」まで遡ると、後から書いた行なのに仕様書より前に見える
+    const fx = repo({ "src/app.ts": "l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\n" });
+    initProven(fx);
+    const tr = writeTranscript(fx, "s1", [{ role: "user", text: "無関係の雑談" }]);
+    // 1) 同じファイルの離れた場所を先に触る(このhunkにとっては touched)
+    capturedEdit(fx, "src/app.ts", "早い変更\nl2\nl3\nl4\nl5\nl6\nl7\nl8\n", { transcript: tr });
+    tick();
+    // 2) 仕様書を書く
+    capturedEdit(fx, "docs/spec.md", SPEC, { transcript: tr });
+    tick();
+    // 3) 仕様書より後に、別の箇所へ実装を書く(このhunkの author)
+    capturedEdit(fx, "src/app.ts", "早い変更\nl2\nl3\nl4\nl5\nl6\nl7\npayloadCache() // REQ-901\n", {
+      transcript: tr,
+    });
+    runIngest(fx.ws);
+
+    // このファイルには hunk が2つできるので、どれも事後になっていないことを見る
+    const values = specClaims(fx, "src/app.ts").map((c) => c.value);
+    expect(values).toContain("支持");
+    expect(values).not.toContain("事後");
   });
 
   it("既存の仕様書へ今回追記した場合は緩い側(先にあった)に倒す", () => {

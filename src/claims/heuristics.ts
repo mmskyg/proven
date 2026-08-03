@@ -37,26 +37,39 @@ interface UserUtterance {
 }
 
 /**
- * 仕様書がそのコードより後に書かれたか(REQ-824)。
+ * 仕様書がそのコードより後に書かれたか(REQ-824/826)。
  *
  * 捕捉済みの編集イベントの時刻だけで判定する(観測第一)。
- * - true  … 仕様書の最初の編集がコードの最初の編集より後 = 事後の追記
+ * - true  … 仕様書の最初の編集が、この変更を作った編集より後 = 事後の追記
  * - false … 仕様書の方が先にある = 事前の根拠として使える
  * - null  … どちらかの編集が捕捉されていない。断定しない
  *
- * 判定は段落単位ではなくファイル単位。支持根拠の段落だけを追うのが理想だが、
- * 段落の作成時刻は保持していないため、説明可能な近似としてファイルの初回編集を使う。
+ * 比較対象は **この変更を作った編集(refSupport=author)** に限る(REQ-826)。
+ * 位置が重なるだけの編集(touched)まで含めると、READMEのように何度も触るファイルでは
+ * 「そのファイルを最初に触った時刻」まで遡ってしまい、後から書いた行なのに
+ * 仕様書より前と判定される。実測でこの誤判定が3件出た。
+ *
+ * 仕様書側は段落単位ではなくファイル単位の近似(段落の作成時刻を保持していないため)。
  * 以前から存在する仕様書に今回追記した場合は「先にあった」と扱う(緩い側に倒す)。
  */
-function specWrittenAfterCode(db: Sqlite.Database, specFile: string, codeOps: string[]): boolean | null {
-  if (codeOps.length === 0) return null;
-  const holes = codeOps.map(() => "?").join(",");
+function specWrittenAfterCode(
+  db: Sqlite.Database,
+  specFile: string,
+  attribution: HunkAttribution,
+): boolean | null {
+  // author が取れないとき(refSupport未算出・touchedのみ)は断定しない。
+  // 「この変更を作った編集」が特定できていない以上、前後関係も言えない
+  const authorOps = (attribution.refSupport ?? [])
+    .filter((r) => r.support === "author")
+    .map((r) => r.operation_id);
+  if (authorOps.length === 0) return null;
+  const holes = authorOps.map(() => "?").join(",");
   const code = db
     .prepare(
       `SELECT MIN(ts_pre) AS first FROM edit_events
        WHERE operation_id IN (${holes}) AND status='completed' AND ts_pre IS NOT NULL`,
     )
-    .get(...codeOps) as { first: string | null } | undefined;
+    .get(...authorOps) as { first: string | null } | undefined;
   const spec = db
     .prepare(
       "SELECT MIN(ts_pre) AS first FROM edit_events WHERE file=? AND status='completed' AND ts_pre IS NOT NULL",
@@ -300,7 +313,7 @@ export function emitClaimsForHunk(ws: Workspace, db: Sqlite.Database, input: Cla
       const base = explicitRef
         ? `変更行が仕様${hit.req_id}(${hit.heading})を明示参照`
         : `仕様${hit.req_id}(${hit.heading})の本文が変更対象(${bodyHits.slice(0, 3).join(", ")})に言及`;
-      const posthoc = specWrittenAfterCode(db, hit.file, input.events.map((e) => e.operationId));
+      const posthoc = specWrittenAfterCode(db, hit.file, input.attribution);
       specEvidence = [{ type: "spec", file: hit.file, req_id: hit.req_id, section: hit.section }];
       specConf = HEURISTIC_CONF_MAX;
       if (posthoc === true) {
