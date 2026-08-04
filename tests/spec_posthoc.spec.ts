@@ -135,19 +135,69 @@ describe("REQ-824 仕様書がコードより後なら事後として区別す�
     expect(values).not.toContain("事後");
   });
 
-  it("既存の仕様書へ今回追記した場合は緩い側(先にあった)に倒す", () => {
+  it("REQ-830: 仕様書は前から在っても、その要求を後から追記したなら事後", () => {
+    // REQ-824の初版はファイル単位で見ていたため、このケースを「支持」にしていた。
+    // REQ-830 で内容ベースにしたので、要求そのものの前後で判定される。
+    // 期待値を閾値に合わせるのではなく、期待値の方が古い近似を写していた
     const fx = repo({ "src/app.ts": "l1\nl2\nl3\n" });
     initProven(fx);
     const tr = writeTranscript(fx, "s1", [{ role: "user", text: "無関係の雑談" }]);
+    // V: 仕様書は前から在るが REQ-901 は無い
     capturedEdit(fx, "docs/spec.md", "# 仕様\n\nREQ-900 既存の要求。\n", { transcript: tr });
     tick();
+    // T: コードを書く
     capturedEdit(fx, "src/app.ts", "l1\npayloadCache() // REQ-901\nl3\n", { transcript: tr });
     tick();
+    // W: 後から REQ-901 を足す(＝後付けの正当化)
     capturedEdit(fx, "docs/spec.md", `${SPEC}\nREQ-900 既存の要求。\n`, { transcript: tr });
     runIngest(fx.ws);
 
-    // ファイルの初回編集はコードより前なので 支持。段落単位で追わない近似の帰結
+    expect(specClaim(fx, "src/app.ts").value).toBe("事後");
+  });
+
+  it("REQ-830 c-1: 決定的な区間に捕捉外の変更があれば事後と断定しない", () => {
+    const fx = repo({ "src/app.ts": "l1\nl2\nl3\n" });
+    initProven(fx);
+    const tr = writeTranscript(fx, "s1", [{ role: "user", text: "無関係の雑談" }]);
+    // V: REQ-901 を含まない状態を捕捉
+    capturedEdit(fx, "docs/spec.md", "# 仕様\n\nREQ-900 既存の要求。\n", { transcript: tr });
+    tick();
+    // (V, T] に捕捉外の編集で REQ-901 を足す(hookを通さず直接書く)
+    fs.writeFileSync(path.join(fx.dir, "docs/spec.md"), `${SPEC}\nREQ-900 既存の要求。\n`);
+    tick();
+    // T: コードを書く。この時点では REQ-901 は既に在った
+    capturedEdit(fx, "src/app.ts", "l1\npayloadCache() // REQ-901\nl3\n", { transcript: tr });
+    runIngest(fx.ws);
+
+    // V の result と head の内容が食い違う = 決定的な区間が観測できていない → 断定しない
+    const claim = specClaim(fx, "src/app.ts");
+    expect(claim.value).toBe("支持");
+    expect(claim.reason).toContain("前後関係は未観測");
+  });
+
+  it("REQ-830 c-2: 仕様とコードを同一操作で書いた場合は事後にしない", () => {
+    const fx = repo({ "src/app.ts": "l1\nl2\nl3\n" });
+    initProven(fx);
+    const tr = writeTranscript(fx, "s1", [{ role: "user", text: "無関係の雑談" }]);
+    const op = "op_same";
+    capturedEdit(fx, "src/app.ts", "l1\npayloadCache() // REQ-901\nl3\n", { transcript: tr, toolUseId: op });
+    capturedEdit(fx, "docs/spec.md", SPEC, { transcript: tr, toolUseId: op });
+    runIngest(fx.ws);
+
     expect(specClaim(fx, "src/app.ts").value).toBe("支持");
+  });
+
+  it("REQ-830 手順3: 仕様書がコードより後に新規作成された(pre が NULL)なら事後", () => {
+    const fx = repo({ "src/app.ts": "l1\nl2\nl3\n" });
+    initProven(fx);
+    const tr = writeTranscript(fx, "s1", [{ role: "user", text: "無関係の雑談" }]);
+    capturedEdit(fx, "src/app.ts", "l1\npayloadCache() // REQ-901\nl3\n", { transcript: tr });
+    tick();
+    // 仕様書はこの時点で初めて作られる = 最古の捕捉編集の pre_blob_hash が NULL
+    capturedEdit(fx, "docs/spec.md", SPEC, { transcript: tr });
+    runIngest(fx.ws);
+
+    expect(specClaim(fx, "src/app.ts").value).toBe("事後");
   });
 });
 

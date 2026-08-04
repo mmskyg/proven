@@ -303,6 +303,8 @@ export function runIngest(ws: Workspace, opts: { range?: string } = {}): IngestS
           attribution: attr,
           events,
           gapCause: attr.gapCause,
+          // REQ-830 c-1: 仕様書に「次の捕捉編集」が無いときの連続性検査に使う
+          headSpecContent: (f: string) => fileContent(ws, headMap.get(f)),
         });
         for (const k of emitted) claimCounters[k] = (claimCounters[k] ?? 0) + 1;
       }

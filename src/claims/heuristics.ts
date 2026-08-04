@@ -8,6 +8,7 @@ import {
   type ClaimEmitted,
   type EvidenceRef,
 } from "../shared/types.js";
+import { getObject } from "../store/objects.js";
 import { appendEvent } from "../store/events.js";
 import { applyEvent } from "../store/projections.js";
 import type { Workspace } from "../store/paths.js";
@@ -21,6 +22,9 @@ import type { HunkAttribution } from "../ingest/lineage.js";
  * claim根拠規則(v0.3): value≠判定不能→evidence非空+confidence必須 / 判定不能→reason必須。
  */
 
+/** 内容は対応しているが前後関係が未観測のときのconfidence(REQ-830-B)。HEURISTIC_CONF_MAX(0.5)より下 */
+const UNVERIFIED_ORDER_CONF = 0.4;
+
 interface ClaimInput {
   hunkId: string;
   file: string;
@@ -28,6 +32,8 @@ interface ClaimInput {
   attribution: HunkAttribution;
   events: { operationId: string; sessionRef: string; transcriptLine: number | null; agent?: string }[];
   gapCause: { whitespaceOnly: boolean } | null;
+  /** 取り込み対象headでの当該ファイル内容(REQ-830 c-1の連続性検査用)。無ければnull */
+  headSpecContent: (file: string) => string | null;
 }
 
 interface UserUtterance {
@@ -36,33 +42,54 @@ interface UserUtterance {
   path: string;
 }
 
+/** 事後判定の結果(REQ-830)。null相当の原因を区別できるようにする */
+type PosthocVerdict =
+  | { posthoc: true }
+  | { posthoc: false }
+  | { posthoc: null; cause: "author不明" | "仕様書の編集が未捕捉" | "決定的な区間に捕捉外の変更" };
+
+/** 過去内容に、支持根拠が実際に載っていたか(REQ-830 手順5) */
+function historicalContentSupports(content: string, reqId: string, bodyHits: string[]): boolean {
+  if (!content.includes(reqId)) return false;
+  // REQ-830 c-3: IDだけの検査だと「REQ-903は前から在ったが中身を今日書き換えた」を通してしまう。
+  // 非明示経路では一致語も過去内容に在ることを要求する。
+  // 明示参照経路(bodyHits=[reqId])では語の検査を足しても意味がないため、
+  // 「既存REQの書き換え」は文書化された限界として残る
+  const terms = bodyHits.filter((t) => t !== reqId);
+  const lower = content.toLowerCase();
+  return terms.every((t) => lower.includes(t.toLowerCase()));
+}
+
 /**
- * 仕様書がそのコードより後に書かれたか(REQ-824/826)。
+ * その仕様(要求)が、このコード変更より前から在ったか(REQ-824/826/830)。
  *
- * 捕捉済みの編集イベントの時刻だけで判定する(観測第一)。
- * - true  … 仕様書の最初の編集が、この変更を作った編集より後 = 事後の追記
- * - false … 仕様書の方が先にある = 事前の根拠として使える
- * - null  … どちらかの編集が捕捉されていない。断定しない
+ * 判定の対象は**ファイルの存在ではなく要求の存在**(REQ-830)。
+ * ファイルが前から在っても、支持根拠の段落を今日書いたなら事後である。
+ * そこで時刻の比較だけで決めず、**その時点の内容を復元して要求が載っていたかを見る**。
  *
- * 比較対象は **この変更を作った編集(refSupport=author)** に限る(REQ-826)。
- * 位置が重なるだけの編集(touched)まで含めると、READMEのように何度も触るファイルでは
- * 「そのファイルを最初に触った時刻」まで遡ってしまい、後から書いた行なのに
- * 仕様書より前と判定される。実測でこの誤判定が3件出た。
+ * 安全性は次の非対称性に依る:
+ * - ある時点 ≥ T で**不在**が観測された → T より後に追加されたと言い切れる(事後は堅い)
+ * - ある時点 U > T で**存在**が観測された → T 時点の存在は証明しない
+ *   (捕捉外の編集が (T,U] で追加した可能性) → 緩い側(支持)へ倒す
  *
- * 仕様書側は段落単位ではなくファイル単位の近似(段落の作成時刻を保持していないため)。
- * 以前から存在する仕様書に今回追記した場合は「先にあった」と扱う(緩い側に倒す)。
+ * T = authorOps の MIN(ts_pre)。author が取れないときは断定しない(REQ-826)。
+ * 検索は completed のみを対象とする。作成時の編集が aborted だと2番目が最古に見えるが、
+ * その場合は緩い側へ倒れるだけなので許容する(**これは仕様。「バグ」として直さないこと**)。
  */
-function specWrittenAfterCode(
+function specPrecedesCode(
+  ws: Workspace,
   db: Sqlite.Database,
   specFile: string,
+  reqId: string,
+  bodyHits: string[],
   attribution: HunkAttribution,
-): boolean | null {
-  // author が取れないとき(refSupport未算出・touchedのみ)は断定しない。
-  // 「この変更を作った編集」が特定できていない以上、前後関係も言えない
+  headSpecContent: string | null,
+): PosthocVerdict {
   const authorOps = (attribution.refSupport ?? [])
     .filter((r) => r.support === "author")
     .map((r) => r.operation_id);
-  if (authorOps.length === 0) return null;
+  if (authorOps.length === 0) return { posthoc: null, cause: "author不明" };
+
   const holes = authorOps.map(() => "?").join(",");
   const code = db
     .prepare(
@@ -70,13 +97,59 @@ function specWrittenAfterCode(
        WHERE operation_id IN (${holes}) AND status='completed' AND ts_pre IS NOT NULL`,
     )
     .get(...authorOps) as { first: string | null } | undefined;
-  const spec = db
+  if (!code?.first) return { posthoc: null, cause: "author不明" };
+  const T = code.first;
+
+  const authorOpSet = new Set(authorOps);
+  const specEdits = db
     .prepare(
-      "SELECT MIN(ts_pre) AS first FROM edit_events WHERE file=? AND status='completed' AND ts_pre IS NOT NULL",
+      `SELECT operation_id, ts_pre, pre_blob_hash, result_blob_hash FROM edit_events
+        WHERE file=? AND status='completed' AND ts_pre IS NOT NULL ORDER BY ts_pre ASC`,
     )
-    .get(specFile) as { first: string | null } | undefined;
-  if (!code?.first || !spec?.first) return null;
-  return spec.first > code.first;
+    .all(specFile) as {
+    operation_id: string;
+    ts_pre: string;
+    pre_blob_hash: string | null;
+    result_blob_hash: string | null;
+  }[];
+  if (specEdits.length === 0) return { posthoc: null, cause: "仕様書の編集が未捕捉" };
+
+  // REQ-830 c-2: 1操作で複数ファイルを編集するハーネスでは、行間のサブミリ秒順序は
+  // 事実上任意。同一操作、または時刻が並ぶ場合は「同時に書いた」とみなし支持側へ倒す
+  const sameOpOrTie = specEdits.some((e) => authorOpSet.has(e.operation_id) || e.ts_pre === T);
+  if (sameOpOrTie) return { posthoc: false };
+
+  const before = [...specEdits].reverse().find((e) => e.ts_pre < T);
+
+  if (!before) {
+    // 手順3: T以前の捕捉編集が無い = 最古の捕捉編集 U は T より後
+    const oldest = specEdits[0];
+    // pre_blob_hash が NULL なのは「取得不能」ではなく答え。
+    // U(>T) の時点でファイルが存在しなかった = ファイルごと T より後に作られた
+    if (oldest.pre_blob_hash === null) return { posthoc: true };
+    const content = blobText(ws, oldest.pre_blob_hash);
+    if (content === null) return { posthoc: null, cause: "仕様書の編集が未捕捉" };
+    return historicalContentSupports(content, reqId, bodyHits) ? { posthoc: false } : { posthoc: true };
+  }
+
+  const content = before.result_blob_hash === null ? null : blobText(ws, before.result_blob_hash);
+  if (content === null) return { posthoc: null, cause: "仕様書の編集が未捕捉" };
+  if (historicalContentSupports(content, reqId, bodyHits)) return { posthoc: false };
+
+  // REQ-830 c-1: V < T での不在は T 時点の不在を証明しない。
+  // (V, T] に捕捉外の編集があれば、実際にはコードより前から在ったことになる。
+  // V の次の捕捉編集 W(必ず > T)の pre と V の result が一致すれば、その区間は無変更
+  const after = specEdits.find((e) => e.ts_pre > before.ts_pre);
+  const continuous = after
+    ? after.pre_blob_hash !== null && after.pre_blob_hash === before.result_blob_hash
+    : headSpecContent !== null && headSpecContent === content;
+  return continuous ? { posthoc: true } : { posthoc: null, cause: "決定的な区間に捕捉外の変更" };
+}
+
+/** blobを本文として取り出す。binary/oversizeは本文が保存されないためnull(REQ-830 手順4) */
+function blobText(ws: Workspace, hash: string): string | null {
+  const buf = getObject(ws, hash);
+  return buf ? buf.toString("utf8") : null;
 }
 
 /**
@@ -313,18 +386,27 @@ export function emitClaimsForHunk(ws: Workspace, db: Sqlite.Database, input: Cla
       const base = explicitRef
         ? `変更行が仕様${hit.req_id}(${hit.heading})を明示参照`
         : `仕様${hit.req_id}(${hit.heading})の本文が変更対象(${bodyHits.slice(0, 3).join(", ")})に言及`;
-      const posthoc = specWrittenAfterCode(db, hit.file, input.attribution);
       specEvidence = [{ type: "spec", file: hit.file, req_id: hit.req_id, section: hit.section }];
-      specConf = HEURISTIC_CONF_MAX;
-      if (posthoc === true) {
+      // REQ-830-C: candidate/broken は帰属自体が推定なので、その上に前後関係を載せない
+      // (instructed 側の REQ-411「推定の上に推定を重ねない」と揃える)
+      const v: PosthocVerdict =
+        input.attribution.status === "linked"
+          ? specPrecedesCode(ws, db, hit.file, hit.req_id, bodyHits, input.attribution, input.headSpecContent(hit.file))
+          : { posthoc: null, cause: "author不明" };
+      if (v.posthoc === true) {
         // 支持にはしない。necessity も essential にならないので unsolicited候補 のまま残る
         specValue = "事後";
-        specReason = `${base}。ただし ${hit.file} はこの変更より後に書かれており、事前の根拠にならない`;
-      } else if (posthoc === null) {
+        specConf = HEURISTIC_CONF_MAX;
+        specReason = `${base}。ただし ${hit.req_id} はこの変更を作った編集より後に書かれており、事前の根拠にならない`;
+      } else if (v.posthoc === null) {
+        // 内容の対応は観測できている。前後関係だけが未観測なので値は残し confidence を落とす。
+        // reason は3原因を区別する(REQ-830-B。分割claimの代わりに軸を運ぶので文言を安定させる)
         specValue = "支持";
-        specReason = `${base}(仕様書の作成時期は未観測)`;
+        specConf = UNVERIFIED_ORDER_CONF;
+        specReason = `${base}(前後関係は未観測: ${v.cause})`;
       } else {
         specValue = "支持";
+        specConf = HEURISTIC_CONF_MAX;
         specReason = base;
       }
     } else {
