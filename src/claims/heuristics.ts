@@ -12,7 +12,7 @@ import { getObject } from "../store/objects.js";
 import { appendEvent } from "../store/events.js";
 import { applyEvent } from "../store/projections.js";
 import type { Workspace } from "../store/paths.js";
-import { lookupReq, searchSpec, specParagraph, tokenize } from "../spec/index.js";
+import { lookupReq, paragraphFrequency, searchSpec, specParagraph, tokenize } from "../spec/index.js";
 import { adapterById, claudeCodeAdapter } from "../agents/index.js";
 import type { RawHunk } from "../ingest/diff.js";
 import type { HunkAttribution } from "../ingest/lineage.js";
@@ -24,6 +24,9 @@ import type { HunkAttribution } from "../ingest/lineage.js";
 
 /** 内容は対応しているが前後関係が未観測のときのconfidence(REQ-830-B)。HEURISTIC_CONF_MAX(0.5)より下 */
 const UNVERIFIED_ORDER_CONF = 0.4;
+
+/** 最上位と次点のスコア差がこれ未満なら候補を絞れていないとみなす(REQ-832) */
+const AMBIGUOUS_SCORE_MARGIN = 0.15;
 
 interface ClaimInput {
   hunkId: string;
@@ -445,8 +448,32 @@ export function emitClaimsForHunk(ws: Workspace, db: Sqlite.Database, input: Cla
       : [...targets.symbols, ...targets.fileNames].filter(
           (t) => t && isDistinctiveTarget(t) && paragraph.toLowerCase().includes(t),
         );
+    // REQ-832-A: 仕様書自身の変更を、その仕様書の要求で「支持」しない。
+    // 要求を書いている変更に「その要求が支持している」は循環で根拠にならない
+    const selfReference = hit.file === input.file;
+    // REQ-832-B: 明示参照でない一致は「語の識別力」で判定する。
+    // 一致語1件で足りると「自動テスト」「sessionref」のようにどこにでも出る語で誤結合する。
+    // 強い一致 = その語が出る段落が少ない。強い一致1件、または任意の一致2件を要求する
+    const strongHits = explicitRef
+      ? bodyHits
+      : bodyHits.filter((t) => {
+          const { hits, total } = paragraphFrequency(ws, t);
+          return hits > 0 && (hits <= 2 || hits <= Math.max(1, Math.floor(total * 0.1)));
+        });
+    const enoughHits = explicitRef || strongHits.length >= 1 || bodyHits.length >= 2;
+    // REQ-832-B: 希少語でも複数のREQに同程度で一致しうる。最上位と次点の差が小さければ絞れていない
+    const ambiguous =
+      !explicitRef &&
+      hit.runnerUpScore != null &&
+      Math.abs(hit.score - hit.runnerUpScore) < AMBIGUOUS_SCORE_MARGIN;
     if (refMismatch) {
       specReason = `変更行は${targets.reqRefs.slice(0, 2).join(", ")}を参照しているが、候補仕様(${hit.req_id})と一致しない`;
+    } else if (selfReference) {
+      specReason = `変更対象が仕様書 ${hit.file} 自身のため、${hit.req_id} を支持根拠にしない(循環)`;
+    } else if (bodyHits.length > 0 && !enoughHits) {
+      specReason = `候補仕様${hit.req_id}との一致が一般的な語(${bodyHits.slice(0, 3).join(", ")})のみで、偶然の可能性を排除できない`;
+    } else if (bodyHits.length > 0 && ambiguous) {
+      specReason = `候補仕様が複数あり絞れない(${hit.req_id}と次点のスコア差が小さい)`;
     } else if (bodyHits.length > 0) {
       const base = explicitRef
         ? `変更行が仕様${hit.req_id}(${hit.heading})を明示参照`

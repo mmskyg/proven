@@ -119,6 +119,35 @@ export interface SpecHit {
   heading: string;
   snippet: string;
   score: number;
+  /** 次点候補のスコア(REQ-832)。曖昧性の判定に使う。候補が1件ならnull */
+  runnerUpScore?: number | null;
+}
+
+/**
+ * その語が仕様索引の何段落に出るか(REQ-832)。
+ * 「自動テスト」のようにどこにでも出る語で紐づく誤結合を、閾値ではなく
+ * 語の識別力そのもので潰すために使う。spec_index から計算でき新しい状態を持たない。
+ */
+export function paragraphFrequency(ws: Workspace, term: string): { hits: number; total: number } {
+  const db = openDb(ws);
+  try {
+    // tokens列は「トークン列」であって原文ではない(日本語は2-gramに割られている)。
+    // 生の部分文字列で照合すると日本語の語が常に0件になるため、
+    // 検索語も同じ tokenize を通してから、全トークンが載っている段落を数える
+    const wanted = tokenize(term);
+    if (wanted.length === 0) return { hits: 0, total: 0 };
+    const rows = db.prepare("SELECT tokens FROM spec_index").all() as { tokens: string }[];
+    let hits = 0;
+    for (const r of rows) {
+      const set = new Set((r.tokens ?? "").split(/\s+/));
+      if (wanted.every((t) => set.has(t))) hits++;
+    }
+    return { hits, total: rows.length };
+  } catch {
+    return { hits: 0, total: 0 };
+  } finally {
+    db.close();
+  }
 }
 
 /**
@@ -147,13 +176,23 @@ export function searchSpec(ws: Workspace, queryTokens: string[]): SpecHit | null
       .slice(0, 12)
       .map((t) => `"${t.replace(/"/g, "")}"`)
       .join(" OR ");
-    const row = db
+    // REQ-832: 次点も取る。希少語であっても複数のREQに同程度で一致しうるため、
+    // 「最上位と次点の差」が無いと曖昧性を判定できない
+    const rows = db
       .prepare(
         `SELECT req_id, file, section, heading, snippet(spec_fts, 2, '', '', '…', 24) AS snippet, rank
-         FROM spec_fts WHERE spec_fts MATCH ? ORDER BY rank LIMIT 1`,
+         FROM spec_fts WHERE spec_fts MATCH ? ORDER BY rank LIMIT 2`,
       )
-      .get(q) as { req_id: string; file: string; section: string; heading: string; snippet: string; rank: number } | undefined;
-    if (!row) return null;
+      .all(q) as {
+      req_id: string;
+      file: string;
+      section: string;
+      heading: string;
+      snippet: string;
+      rank: number;
+    }[];
+    if (rows.length === 0) return null;
+    const [row, next] = rows;
     return {
       req_id: row.req_id || null,
       file: row.file,
@@ -161,6 +200,7 @@ export function searchSpec(ws: Workspace, queryTokens: string[]): SpecHit | null
       heading: row.heading,
       snippet: row.snippet,
       score: -row.rank, // fts5 rankは小さいほど良い
+      runnerUpScore: next ? -next.rank : null,
     };
   } catch {
     return null;
