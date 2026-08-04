@@ -229,8 +229,43 @@ describe("REQ-827 role=userでも人の発話でない行は指示として読�
     const got = readClaudeUtterances(p, null, 10).map((u) => u.text);
     expect(got).toHaveLength(1);
     expect(got[0]).toContain("READMEを直して");
+    expect(got.join(" ")).not.toContain("sqlite");
     // 伝送メタデータ(全発話に必ず入る固定語)は本文として残さない
     expect(got[0]).not.toContain("discord");
     expect(got[0]).not.toContain("<channel");
+  });
+});
+
+describe("REQ-834 サブエージェント/チームメイトの発言を人の指示に数えない", () => {
+  it("teammate-message と sidechain は発話として読まない", () => {
+    const fx = repo({ "a.ts": "x\n" });
+    const p = path.join(fx.transcriptDir, "t2.jsonl");
+    fs.writeFileSync(
+      p,
+      [
+        JSON.stringify({
+          message: { role: "user", content: '<channel source="plugin:discord:discord">READMEを直して</channel>' },
+        }),
+        // 実測でinstructed=ありの誤検出を生んでいた形。機械が書いたレビュー文
+        JSON.stringify({
+          message: {
+            role: "user",
+            content:
+              'Another Claude session sent a message: <teammate-message teammate_id="fable-review">' +
+              "statSync isFile Buffer manifest entries について指摘します</teammate-message>",
+          },
+        }),
+        // サブエージェントのプロンプト(親エージェントが書いたもの)
+        JSON.stringify({
+          isSidechain: true,
+          message: { role: "user", content: "commitHeadRef と buildCommitRevision を調べて" },
+        }),
+      ].join("\n") + "\n",
+    );
+    const got = readClaudeUtterances(p, null, 10).map((u) => u.text);
+    expect(got).toHaveLength(1);
+    expect(got[0]).toContain("READMEを直して");
+    expect(got.join(" ")).not.toContain("statSync");
+    expect(got.join(" ")).not.toContain("buildCommitRevision");
   });
 });

@@ -24,6 +24,14 @@ function isNonSpeech(obj: Record<string, unknown>, text: string): boolean {
   if (obj.isCompactSummary === true) return true;
   // スラッシュコマンドの起動と、その標準出力。人の指示ではない
   if (/<command-name>|<local-command-stdout>|<local-command-stderr>/.test(text)) return true;
+  // REQ-834: サブエージェント/チームメイトの発言も role=user で届く。
+  // これらは機械が書いたレビュー文で、ファイル名と識別子が密に並ぶため、
+  // コンパクション要約と同じく「ほぼ何にでも一致する」誤検出源になる。
+  // 実測: fable のレビュー文1本が buffer/statsync/isfile 等で複数のhunkに
+  // instructed=あり を付けていた
+  if (/<teammate-message\b|Another Claude session sent a message:/.test(text)) return true;
+  // サブエージェントのプロンプト(sidechain)は親エージェントが書いたもので人の発話ではない
+  if (obj.isSidechain === true) return true;
   return false;
 }
 
