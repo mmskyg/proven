@@ -84,8 +84,15 @@ export function runIngest(ws: Workspace, opts: { range?: string } = {}): IngestS
     if (opts.range) {
       const m = opts.range.split("..");
       if (m.length !== 2 || !m[0] || !m[1]) throw new ProvenError("input", `--range はA..B形式で指定してください: ${opts.range}`);
-      baseRef = buildCommitRevision(ws, m[0]).ref;
-      headRef = buildCommitRevision(ws, m[1]).ref;
+      const baseRev = buildCommitRevision(ws, m[0]);
+      const headRev = buildCommitRevision(ws, m[1]);
+      baseRef = baseRev.ref;
+      headRef = headRev.ref;
+      // REQ-829: commit側のper-fileスキップも黙らせない(worktree側と揃える)
+      const skipped = [...(baseRev.unreadable ?? []), ...(headRev.unreadable ?? [])];
+      if (skipped.length > 0) {
+        warnings.push(`読めなかったため対象外にしたファイル: ${[...new Set(skipped)].join(", ")}`);
+      }
     } else {
       const last = db
         .prepare("SELECT head_revision_ref FROM ingest_runs ORDER BY ts DESC, job_id DESC LIMIT 1")

@@ -187,6 +187,24 @@ describe("REQ-824 仕様書がコードより後なら事後として区別す�
     expect(specClaim(fx, "src/app.ts").value).toBe("支持");
   });
 
+  it("REQ-830 M1: 無関係な同時編集があっても、後から追記された要求は事後", () => {
+    // c-2の緩和を「1件でも同一操作があれば支持」にすると、typo修正のような
+    // 無関係な同時編集1件で、その後の追記まで支持に化ける
+    const fx = repo({ "src/app.ts": "l1\nl2\nl3\n" });
+    initProven(fx);
+    const tr = writeTranscript(fx, "s1", [{ role: "user", text: "無関係の雑談" }]);
+    const op = "op_same";
+    // 同一操作でコードと仕様書を触るが、仕様書側にはまだ REQ-901 が無い
+    capturedEdit(fx, "src/app.ts", "l1\npayloadCache() // REQ-901\nl3\n", { transcript: tr, toolUseId: op });
+    capturedEdit(fx, "docs/spec.md", "# 仕様\n\nREQ-900 既存の要求。\n", { transcript: tr, toolUseId: op });
+    tick();
+    // 後から REQ-901 を追記する = 後付けの正当化
+    capturedEdit(fx, "docs/spec.md", `${SPEC}\nREQ-900 既存の要求。\n`, { transcript: tr });
+    runIngest(fx.ws);
+
+    expect(specClaim(fx, "src/app.ts").value).toBe("事後");
+  });
+
   it("REQ-830 手順3: 仕様書がコードより後に新規作成された(pre が NULL)なら事後", () => {
     const fx = repo({ "src/app.ts": "l1\nl2\nl3\n" });
     initProven(fx);

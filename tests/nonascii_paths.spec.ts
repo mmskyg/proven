@@ -45,15 +45,38 @@ describe("REQ-829 non-ASCIIファイル名がmanifestから落ちない", () => 
     expect(r.hunks).toBeGreaterThan(0);
   });
 
-  it("読めなかったパスはファイル名つきで警告に出る(黙って捨てない)", () => {
+  it("コミット前の削除は警告しない(削除hunkとして正しくレビューされるため)", () => {
     const fx = repo({ "ascii.ts": "a\n" });
     initProven(fx);
-    // git のindexには在るが実体が無いパスを作る(削除をindexへ反映しない)
+    // index には在るが worktree から消えている = 通常の削除。
+    // head manifest から消えることで削除hunkになりレビューされるので、
+    // ここで「読めなかった」と警告すると、rm からコミットまでの間ずっと嘘が出続ける
     fs.writeFileSync(path.join(fx.dir, "消えたファイル.md"), "x\n");
     sh(fx.dir, "git", ["add", "-A"]);
     fs.unlinkSync(path.join(fx.dir, "消えたファイル.md"));
 
-    const { unreadable } = buildWorktreeRevision(fx.ws);
-    expect(unreadable).toContain("消えたファイル.md");
+    expect(buildWorktreeRevision(fx.ws).unreadable).toEqual([]);
+  });
+
+  it("削除以外の理由で読めないパスはファイル名つきで報告する(黙って捨てない)", () => {
+    const fx = repo({ "ascii.ts": "a\n" });
+    initProven(fx);
+    const target = path.join(fx.dir, "読めないファイル.md");
+    fs.writeFileSync(target, "x\n");
+    sh(fx.dir, "git", ["add", "-A"]);
+    fs.chmodSync(target, 0o000);
+    try {
+      // rootだと権限を無視して読めてしまうので、その場合はこのケースを検証できない
+      let denied = false;
+      try {
+        fs.readFileSync(target);
+      } catch {
+        denied = true;
+      }
+      if (!denied) return;
+      expect(buildWorktreeRevision(fx.ws).unreadable).toContain("読めないファイル.md");
+    } finally {
+      fs.chmodSync(target, 0o644);
+    }
   });
 });

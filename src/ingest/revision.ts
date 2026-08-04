@@ -84,10 +84,14 @@ export function buildWorktreeRevision(ws: Workspace): {
       if (!st.isFile()) continue; // ディレクトリ・symlink等は元から対象外
       buf = fs.readFileSync(abs);
       mode = (st.mode & 0o111) !== 0 ? "100755" : "100644";
-    } catch {
-      // REQ-829: 以前はここで無言の continue だった。パス破損・権限・競合削除の
-      // いずれでも同じく無音になるため、必ず呼び出し側へ知らせる
-      unreadable.push(rel);
+    } catch (e) {
+      // REQ-829: 以前はここで無言の continue だった。パス破損・権限のいずれでも
+      // 同じく無音になるため、必ず呼び出し側へ知らせる。
+      //
+      // ただし「indexにあるがworktreeに無い」= コミット前の削除は正常な状態で、
+      // head manifest から消えることで削除hunkとして**きちんとレビューされる**。
+      // ここで警告すると、rm してからコミットするまでの間ずっと嘘の警告が出続ける
+      if ((e as NodeJS.ErrnoException)?.code !== "ENOENT") unreadable.push(rel);
       continue;
     }
     const bin = isBinary(buf) || isOversize(buf);

@@ -25,7 +25,19 @@ import type { HunkAttribution } from "../ingest/lineage.js";
 /** 内容は対応しているが前後関係が未観測のときのconfidence(REQ-830-B)。HEURISTIC_CONF_MAX(0.5)より下 */
 const UNVERIFIED_ORDER_CONF = 0.4;
 
-/** 最上位と次点のスコア差がこれ未満なら候補を絞れていないとみなす(REQ-832) */
+/**
+ * 最上位と次点のスコア差がこれ未満なら候補を絞れていないとみなす(REQ-832)。
+ *
+ * fts5 rank 差の実測(合成コーパスでの探査):
+ * - 対称な同点(同じ希少語が2段落に出る。日本語2-gram含む) … 差は **厳密に 0.0000**
+ * - 明確な勝ち(一致語が1つ多い) … 差は **0.27〜2.49**
+ * - 同一根拠で段落長だけが違う … 差 **0.76**
+ * 観測された分布は {0} ∪ [0.27, ∞) で、(0, 0.15) には何も無い。
+ * つまりこの値は**厳密な同点だけ**を拾う(0.01でも同じ挙動)。死んでもいないし煩くもない。
+ *
+ * ただし見た目より仕事はしていない: 段落長の正規化だけで決まる同根拠の一致(差0.76)は素通りする。
+ * 規模非依存にするなら「次点の段落が最上位と同じ一致語を含むか」を見る(魔法の数字が要らない)。
+ */
 const AMBIGUOUS_SCORE_MARGIN = 0.15;
 
 interface ClaimInput {
@@ -49,11 +61,12 @@ interface UserUtterance {
 type PosthocVerdict =
   | { posthoc: true }
   | { posthoc: false }
-  | { posthoc: null; cause: "author不明" | "仕様書の編集が未捕捉" | "決定的な区間に捕捉外の変更" };
+  | { posthoc: null; cause: "author不明" | "仕様書の編集が未捕捉" | "内容を復元できない" | "決定的な区間に捕捉外の変更" };
 
 /** 過去内容に、支持根拠が実際に載っていたか(REQ-830 手順5) */
 function historicalContentSupports(content: string, reqId: string, bodyHits: string[]): boolean {
-  if (!content.includes(reqId)) return false;
+  // "REQ-901" が "REQ-9012" に部分一致すると、存在しない要求を「在った」と誤認する
+  if (!new RegExp(`${reqId}(?!\\d)`).test(content)) return false;
   // REQ-830 c-3: IDだけの検査だと「REQ-903は前から在ったが中身を今日書き換えた」を通してしまう。
   // 非明示経路では一致語も過去内容に在ることを要求する。
   // 明示参照経路(bodyHits=[reqId])では語の検査を足しても意味がないため、
@@ -118,11 +131,14 @@ function specPrecedesCode(
   if (specEdits.length === 0) return { posthoc: null, cause: "仕様書の編集が未捕捉" };
 
   // REQ-830 c-2: 1操作で複数ファイルを編集するハーネスでは、行間のサブミリ秒順序は
-  // 事実上任意。同一操作、または時刻が並ぶ場合は「同時に書いた」とみなし支持側へ倒す
-  const sameOpOrTie = specEdits.some((e) => authorOpSet.has(e.operation_id) || e.ts_pre === T);
-  if (sameOpOrTie) return { posthoc: false };
-
-  const before = [...specEdits].reverse().find((e) => e.ts_pre < T);
+  // 事実上任意。同一操作・同時刻の仕様書編集は「T以前」に含める。
+  //
+  // ここを「1件でも同一操作があれば即 支持」にしてはいけない(実測でfableが指摘)。
+  // 無関係な同時編集(typo修正など)が1件あるだけで、その後に追記された要求まで
+  // 支持に化けてしまう。あくまで**決定的な編集**の判定を content に委ねるための緩和
+  const atOrBefore = (e: { ts_pre: string; operation_id: string }): boolean =>
+    e.ts_pre < T || e.ts_pre === T || authorOpSet.has(e.operation_id);
+  const before = [...specEdits].reverse().find(atOrBefore);
 
   if (!before) {
     // 手順3: T以前の捕捉編集が無い = 最古の捕捉編集 U は T より後
@@ -131,18 +147,19 @@ function specPrecedesCode(
     // U(>T) の時点でファイルが存在しなかった = ファイルごと T より後に作られた
     if (oldest.pre_blob_hash === null) return { posthoc: true };
     const content = blobText(ws, oldest.pre_blob_hash);
-    if (content === null) return { posthoc: null, cause: "仕様書の編集が未捕捉" };
+    // 編集は捕捉されている。復元できないのは中身(binary/oversizeは未保存・purge済み)
+    if (content === null) return { posthoc: null, cause: "内容を復元できない" };
     return historicalContentSupports(content, reqId, bodyHits) ? { posthoc: false } : { posthoc: true };
   }
 
   const content = before.result_blob_hash === null ? null : blobText(ws, before.result_blob_hash);
-  if (content === null) return { posthoc: null, cause: "仕様書の編集が未捕捉" };
+  if (content === null) return { posthoc: null, cause: "内容を復元できない" };
   if (historicalContentSupports(content, reqId, bodyHits)) return { posthoc: false };
 
   // REQ-830 c-1: V < T での不在は T 時点の不在を証明しない。
   // (V, T] に捕捉外の編集があれば、実際にはコードより前から在ったことになる。
   // V の次の捕捉編集 W(必ず > T)の pre と V の result が一致すれば、その区間は無変更
-  const after = specEdits.find((e) => e.ts_pre > before.ts_pre);
+  const after = specEdits.find((e) => !atOrBefore(e) && e.ts_pre > before.ts_pre);
   const continuous = after
     ? after.pre_blob_hash !== null && after.pre_blob_hash === before.result_blob_hash
     : headSpecContent !== null && headSpecContent === content;
@@ -342,11 +359,15 @@ export function emitClaimsForHunk(ws: Workspace, db: Sqlite.Database, input: Cla
     const authorRefs = new Set(
       (input.attribution.refSupport ?? []).filter((r) => r.support === "author").map((r) => r.operation_id),
     );
-    const ordered = [
-      ...linkedEvents.filter((e) => authorRefs.has(e.operationId)),
-      ...linkedEvents.filter((e) => !authorRefs.has(e.operationId)),
-    ];
-    const readable = ordered.filter((e) => e.transcriptLine !== null && fs.existsSync(e.sessionRef));
+    // author が特定できるなら **author の窓だけ** を探索する。
+    // touched の窓は author 編集より後ろに伸びうるため、変更より後の発話まで
+    // 探索範囲に入ってしまう(「その retryBackoffMillis いいね」のような事後の言及で
+    // instructed=あり が立つ)。旧実装の linkedEvents[0] 固定は最古refを見ていたので
+    // 偶然この点では保守的だった。author が無いときだけ全窓に落とす
+    const isReadable = (e: { transcriptLine: number | null; sessionRef: string }): boolean =>
+      e.transcriptLine !== null && fs.existsSync(e.sessionRef);
+    const authorReadable = linkedEvents.filter((e) => authorRefs.has(e.operationId) && isReadable(e));
+    const readable = authorReadable.length > 0 ? authorReadable : linkedEvents.filter(isReadable);
     if (readable.length === 0) {
       instructedReason = "transcriptが読めない(context_status=transcript_broken)";
     } else {

@@ -107,3 +107,38 @@ describe("REQ-831-B 会話窓をlinkedEvents[0]に固定しない", () => {
     expect(instructedClaim(fx, "svc.ts").value).toBe("あり");
   });
 });
+
+describe("REQ-831-B M2 探索窓は author の窓に限る(変更より後の発話を入れない)", () => {
+  // ⚠️ このテストは**判別力が無い**(回帰ガードにとどまる)。
+  // 意図した状況は「1つのhunkに author と、それより後の touched が両方紐づく」だが、
+  // 現在のヘルパーではこのfixtureで author ref が生成されず(両hunkとも touched のみ)、
+  // 修正の有無にかかわらず通ってしまう。M2の修正そのものは未検証。
+  // 判別可能なfixtureの作り方はレビュアーに問い合わせ中。
+  it("後続セッションの事後の言及で断定しない(※判別力なし・回帰ガード)", () => {
+    const fx = repo({ "svc.ts": "l1\nl2\nl3\nl4\nl5\n" });
+    initProven(fx);
+    // author: 指示のないセッションで本題の行を書く
+    const trA = writeTranscript(fx, "sA", [{ role: "user", text: "今日は天気がいいですね" }]);
+    capturedEdit(fx, "svc.ts", "l1\nl2\nl3\nl4\nconst retryBackoffMillis = 500;\n", { transcript: trA });
+    // touched: 後から別の行を触る。そのセッションには対象語を含む事後の言及がある
+    const trB = writeTranscript(fx, "sB", [
+      { role: "user", text: "さっきの retryBackoffMillis を svc.ts に入れたのいいね" },
+    ]);
+    capturedEdit(fx, "svc.ts", "先頭\nl2\nl3\nl4\nconst retryBackoffMillis = 500;\n", { transcript: trB });
+    runIngest(fx.ws);
+
+    const db = openDb(fx.ws);
+    try {
+      const rows = db
+        .prepare(
+          `SELECT c.value AS value FROM claims c JOIN hunks h ON h.hunk_instance_id=c.hunk_ref
+            WHERE c.kind='instructed' AND h.file='svc.ts' AND h.new_start >= 5`,
+        )
+        .all() as { value: string }[];
+      // retryBackoffMillis の行(author=sA、指示なし)が、後のsBの言及で「あり」になってはいけない
+      expect(rows.map((r) => r.value)).not.toContain("あり");
+    } finally {
+      db.close();
+    }
+  });
+});
