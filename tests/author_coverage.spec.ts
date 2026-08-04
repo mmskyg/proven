@@ -1,4 +1,6 @@
 // 対象: author判定が連言を見ていない問題 (REQ-835) と、author不明時の探索窓の上限 (REQ-836)
+import fs from "node:fs";
+import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { runIngest } from "../src/ingest/ingest.js";
 import { openDb } from "../src/store/projections.js";
@@ -48,6 +50,25 @@ describe("REQ-835 単独では弱い行でも、並び・全被覆なら author 
     const tr = writeTranscript(fx, "s1", [{ role: "user", text: "雑談" }]);
     capturedEdit(fx, "svc.ts", "l1\ncount++;\nl3\n", { transcript: tr });
     runIngest(fx.ws);
+    expect(supports(fx, "svc.ts")).not.toContain("author");
+  });
+});
+
+describe("REQ-835 (c) 空行で被覆を水増ししない", () => {
+  it("空行の一致で被覆を満たしたことにしない", () => {
+    // 純粋な追加だけにして (b)連続run と (a)informative を発火させず、
+    // (c)全被覆の判定だけを見る
+    const fx = repo({ "svc.ts": "l1\nl4\n" });
+    initProven(fx);
+    const tr = writeTranscript(fx, "s1", [{ role: "user", text: "雑談" }]);
+    // イベント: x++; と空行だけを追加(y++; は書いていない)
+    capturedEdit(fx, "svc.ts", "l1\nx++;\n\nl4\n", { transcript: tr });
+    // hook外で y++; を足す。hunkの追加行は x++; / 空行 / y++; の3行になる
+    fs.writeFileSync(path.join(fx.dir, "svc.ts"), "l1\nx++;\n\ny++;\nl4\n");
+    runIngest(fx.ws);
+
+    // matched を合計で数えると、空行の一致が水増しになって被覆したことになる。
+    // 実際にはイベントは y++; を書いていない
     expect(supports(fx, "svc.ts")).not.toContain("author");
   });
 });

@@ -249,24 +249,34 @@ export function refSupportOf(contents: EventContent[], refs: string[], hunk: Raw
  * `const x = 500;` 単独は (a)(b)(c) いずれも満たさず touched のまま。
  */
 function authorSupport(hunk: RawHunk, c: EventContent): boolean {
-  const matched = [
-    ...multisetIntersect(hunk.addedLines, c.addedLines),
-    ...multisetIntersect(hunk.removedLines, c.removedLines),
-  ];
+  const ne = (xs: string[]): string[] => xs.filter((l) => l.trim() !== "");
+  const matchedAdded = multisetIntersect(hunk.addedLines, c.addedLines);
+  const matchedRemoved = multisetIntersect(hunk.removedLines, c.removedLines);
   // (a) 従来規則
-  if (matched.some(isInformativeLine)) return true;
-  if (matched.length === 0) return false;
+  if ([...matchedAdded, ...matchedRemoved].some(isInformativeLine)) return true;
+  if (matchedAdded.length + matchedRemoved.length === 0) return false;
   // (b) 連続した並び(informativeness は問わない。並んでいること自体が根拠)
   if (contiguousRun(hunk.addedLines, c.addedLines) >= 2) return true;
   if (contiguousRun(hunk.removedLines, c.removedLines) >= 2) return true;
   // (c) hunkの変更行をイベントが全て含む。
+  //
   // 「2行以上」は added / removed の**片側で**数える。両者の合計にすると
   // 1行置換(added 1 + removed 1)が該当してしまい、(a)で弾いたはずの
-  // 「弱い行1本」が裏口から author になる
-  const added = hunk.addedLines.filter((l) => l.trim() !== "");
-  const removed = hunk.removedLines.filter((l) => l.trim() !== "");
-  const multiLine = added.length >= 2 || removed.length >= 2;
-  if (multiLine && matched.length >= added.length + removed.length) return true;
+  // 「弱い行1本」が裏口から author になる。
+  //
+  // 被覆も**空行を除いて片側ごとに**数える。matched を合計で見ると、
+  // hunk側の空行がイベント側の空行と一致した分が水増しになり、
+  // 実際には含まれていない行があっても被覆したことになってしまう
+  const addedNE = ne(hunk.addedLines);
+  const removedNE = ne(hunk.removedLines);
+  const multiLine = addedNE.length >= 2 || removedNE.length >= 2;
+  if (
+    multiLine &&
+    ne(matchedAdded).length >= addedNE.length &&
+    ne(matchedRemoved).length >= removedNE.length
+  ) {
+    return true;
+  }
   return false;
 }
 
