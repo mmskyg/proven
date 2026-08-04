@@ -260,6 +260,12 @@ describe("REQ-834 サブエージェント/チームメイトの発言を人の�
           isSidechain: true,
           message: { role: "user", content: "commitHeadRef と buildCommitRevision を調べて" },
         }),
+        // ツール実行で注入された内容(skill本文など)。人が打った発話ではない
+        JSON.stringify({
+          sourceToolUseID: "toolu_01abc",
+          isMeta: true,
+          message: { role: "user", content: "# Claude in Chrome browser automation\nsessionRef を使います" },
+        }),
       ].join("\n") + "\n",
     );
     const got = readClaudeUtterances(p, null, 10).map((u) => u.text);
@@ -267,5 +273,6 @@ describe("REQ-834 サブエージェント/チームメイトの発言を人の�
     expect(got[0]).toContain("READMEを直して");
     expect(got.join(" ")).not.toContain("statSync");
     expect(got.join(" ")).not.toContain("buildCommitRevision");
+    expect(got.join(" ")).not.toContain("browser automation");
   });
 });

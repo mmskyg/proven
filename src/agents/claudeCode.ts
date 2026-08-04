@@ -32,6 +32,11 @@ function isNonSpeech(obj: Record<string, unknown>, text: string): boolean {
   if (/<teammate-message\b|Another Claude session sent a message:/.test(text)) return true;
   // サブエージェントのプロンプト(sidechain)は親エージェントが書いたもので人の発話ではない
   if (obj.isSidechain === true) return true;
+  // REQ-834: ツール実行の結果として注入された内容(skillの本文・システムプロンプト等)。
+  // sourceToolUseID を持つ行はツール由来で、人が打った発話ではない。
+  // 実測: skillの説明文がuser発話として読まれ、claude/session で instructed=あり になっていた。
+  // 対象セッションで本物のチャネル発話44件のうち、この条件に当たるものは0件
+  if (typeof obj.sourceToolUseID === "string" && obj.sourceToolUseID) return true;
   return false;
 }
 
