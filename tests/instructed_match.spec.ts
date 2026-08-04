@@ -26,6 +26,27 @@ function targetsOf(file: string, added: string[]) {
   } as never);
 }
 
+function refSupports(fx: Fixture, file: string): string[] {
+  const db = openDb(fx.ws);
+  try {
+    return (
+      db
+        .prepare(
+          `SELECT DISTINCT l.support AS support FROM lineage_links l
+             JOIN hunks h ON h.hunk_instance_id = l.hunk_instance_id
+            WHERE h.file=? AND l.support IS NOT NULL`,
+        )
+        .all(file) as { support: string }[]
+    ).map((r) => r.support);
+  } finally {
+    db.close();
+  }
+}
+
+function hasAuthorRef(fx: Fixture, file: string): boolean {
+  return refSupports(fx, file).includes("author");
+}
+
 function instructedClaim(fx: Fixture, file: string): { value: string; reason: string } {
   const db = openDb(fx.ws);
   try {
@@ -97,48 +118,57 @@ describe("REQ-831-B 会話窓をlinkedEvents[0]に固定しない", () => {
     // 1回目: 雑談セッション。同じ行を中間状態にする(最終hunkには残らない=touched)
     const tr1 = writeTranscript(fx, "s1", [{ role: "user", text: "今日は天気がいいですね" }]);
     capturedEdit(fx, "svc.ts", "l1\nl2\nl3\nl4\n中間状態\n", { transcript: tr1 });
-    // 2回目: 明示指示のあるセッションで最終形を書く(=author)
+    // 2回目: 明示指示のあるセッションで最終形を書く(=author)。
+    // 行は identifier 2つ以上にする。1識別子の短い行は isInformativeLine を通らず
+    // author と認められないため、author優先の経路ではなくフォールバックを試すことになる
     const tr2 = writeTranscript(fx, "s2", [
       { role: "user", text: "retryBackoffMillis を svc.ts に追加して" },
     ]);
-    capturedEdit(fx, "svc.ts", "l1\nl2\nl3\nl4\nconst retryBackoffMillis = 500;\n", { transcript: tr2 });
+    capturedEdit(
+      fx,
+      "svc.ts",
+      "l1\nl2\nl3\nl4\nconst retryBackoffMillis = computeBackoffBudget(runtimeConfig);\n",
+      { transcript: tr2 },
+    );
     runIngest(fx.ws);
 
+    expect(hasAuthorRef(fx, "svc.ts")).toBe(true); // 前提: author優先の経路を通っていること
     expect(instructedClaim(fx, "svc.ts").value).toBe("あり");
   });
 });
 
 describe("REQ-831-B M2 探索窓は author の窓に限る(変更より後の発話を入れない)", () => {
-  // ⚠️ このテストは**判別力が無い**(回帰ガードにとどまる)。
-  // 意図した状況は「1つのhunkに author と、それより後の touched が両方紐づく」だが、
-  // 現在のヘルパーではこのfixtureで author ref が生成されず(両hunkとも touched のみ)、
-  // 修正の有無にかかわらず通ってしまう。M2の修正そのものは未検証。
-  // 判別可能なfixtureの作り方はレビュアーに問い合わせ中。
-  it("後続セッションの事後の言及で断定しない(※判別力なし・回帰ガード)", () => {
+  it("同一hunkにauthorと後続のtouchedがあるとき、後続窓の事後の言及で断定しない", () => {
     const fx = repo({ "svc.ts": "l1\nl2\nl3\nl4\nl5\n" });
     initProven(fx);
-    // author: 指示のないセッションで本題の行を書く
+    // author: 指示のないセッション。identifier 2つ以上で isInformativeLine を通す
     const trA = writeTranscript(fx, "sA", [{ role: "user", text: "今日は天気がいいですね" }]);
-    capturedEdit(fx, "svc.ts", "l1\nl2\nl3\nl4\nconst retryBackoffMillis = 500;\n", { transcript: trA });
-    // touched: 後から別の行を触る。そのセッションには対象語を含む事後の言及がある
+    capturedEdit(
+      fx,
+      "svc.ts",
+      "l1\nl2\nl3\nl4\nconst retryBackoffMillis = computeBackoffBudget(runtimeConfig);\n",
+      { transcript: trA },
+    );
+    // touched: 変更「後」の言及があるセッション。隣接に無情報の行を足して同一hunkに畳む。
+    // 追加行自体は isInformativeLine を通らないので author にはならない
     const trB = writeTranscript(fx, "sB", [
-      { role: "user", text: "さっきの retryBackoffMillis を svc.ts に入れたのいいね" },
+      { role: "user", text: "retryBackoffMillis と computeBackoffBudget の追加、いいですね" },
     ]);
-    capturedEdit(fx, "svc.ts", "先頭\nl2\nl3\nl4\nconst retryBackoffMillis = 500;\n", { transcript: trB });
+    capturedEdit(
+      fx,
+      "svc.ts",
+      "l1\nl2\nl3\nl4\nconst retryBackoffMillis = computeBackoffBudget(runtimeConfig);\n// note\n",
+      { transcript: trB },
+    );
     runIngest(fx.ws);
 
-    const db = openDb(fx.ws);
-    try {
-      const rows = db
-        .prepare(
-          `SELECT c.value AS value FROM claims c JOIN hunks h ON h.hunk_instance_id=c.hunk_ref
-            WHERE c.kind='instructed' AND h.file='svc.ts' AND h.new_start >= 5`,
-        )
-        .all() as { value: string }[];
-      // retryBackoffMillis の行(author=sA、指示なし)が、後のsBの言及で「あり」になってはいけない
-      expect(rows.map((r) => r.value)).not.toContain("あり");
-    } finally {
-      db.close();
-    }
+    // 前提: この hunk が author と touched の両方を持つこと。
+    // isInformativeLine を誰かが変えたらここで気づけるようにしておく
+    const sup = refSupports(fx, "svc.ts");
+    expect(sup).toContain("author");
+    expect(sup).toContain("touched");
+
+    // 変更より後の言及なので指示ではない
+    expect(instructedClaim(fx, "svc.ts").value).toBe("判定不能");
   });
 });
