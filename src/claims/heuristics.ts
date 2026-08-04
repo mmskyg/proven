@@ -252,12 +252,51 @@ function containsToken(utterance: string, token: string): boolean {
 export function instructionMatch(
   utterance: string,
   targets: HunkTargets,
-): { matched: boolean; hitSymbols: string[]; hitFiles: string[] } {
+): { matched: boolean; hitSymbols: string[]; hitFiles: string[]; suppressed: boolean } {
   // REQ-709: 断定に使うのは特徴的な対象語のみ(短い語・日本語2-gram断片は除外)
   const hitSymbols = targets.symbols.filter((s) => isDistinctiveTarget(s) && containsToken(utterance, s));
-  const hitFiles = targets.fileNames.filter((f) => f && containsToken(utterance, f));
+  // REQ-831-A: ファイル名の脚にも汎用語検査を課す。
+  // index.ts / utils.ts のような語幹は汎用語で、containsToken は4文字以上の部分一致を許すため、
+  // ほぼ任意の発話に当たってしまう。拡張子つきbasename("test.ts")は残るので強い信号は維持される
+  const hitFiles = targets.fileNames.filter((f) => f && isDistinctiveTarget(f) && containsToken(utterance, f));
   const targetIdentified = hitSymbols.length >= 2 || (hitFiles.length > 0 && hitSymbols.length >= 1);
-  return { matched: targetIdentified, hitSymbols, hitFiles };
+  if (!targetIdentified) return { matched: false, hitSymbols, hitFiles, suppressed: false };
+
+  // REQ-831-C: 否定表現を伴う候補は根拠に採用しない。
+  // 断定条件に否定検査を足すのではなく候補から外すので、断定を減らす方向にしか働かない
+  const hits = [...hitSymbols, ...hitFiles];
+  if (negationSuppresses(utterance, hits)) {
+    return { matched: false, hitSymbols, hitFiles, suppressed: true };
+  }
+  return { matched: true, hitSymbols, hitFiles, suppressed: false };
+}
+
+/** 否定表現。「忘れないで」等は肯定の指示なので除く(REQ-831-C) */
+const NEGATION_RE = /(ないで|しないで|せずに|触らず|使わず|禁止|除外)/;
+const POSITIVE_NAI_RE = /(忘れないで|欠かさないで|漏らさないで)/;
+
+/**
+ * この発話を根拠から外すべきか(REQ-831-C)。
+ *
+ * 作用範囲は文ではなく節。「Aは触らないで、Bを直して」を文単位で捨てると
+ * Bへの正当な指示まで消えるため、`、`『。』で割った節のうち対象語を含むものだけを見る。
+ *
+ * 「Aを触らずBを直す」のように**1つの節に否定と対象語が2つ以上同居**する場合、
+ * どちらに否定が掛かるかは節分割では決まらない。日本語の係り受け解析は範囲外なので、
+ * **解析不能なら判定不能**に倒す(＝その発話を使わない)。推測で当てにいかない。
+ */
+function negationSuppresses(utterance: string, hits: string[]): boolean {
+  const clauses = utterance.split(/[、。\n]/);
+  for (const clause of clauses) {
+    const inClause = hits.filter((h) => clause.toLowerCase().includes(h.toLowerCase()));
+    if (inClause.length === 0) continue;
+    const stripped = clause.replace(POSITIVE_NAI_RE, "");
+    if (!NEGATION_RE.test(stripped)) continue;
+    // 否定を含む節に対象語がある。1語だけならその語が否定されていると読める。
+    // 2語以上あると係り受けが決まらないので、いずれにせよ根拠に使わない
+    return true;
+  }
+  return false;
 }
 
 function emit(ws: Workspace, db: Sqlite.Database, runId: string, c: Omit<ClaimEmitted, "claim_id" | "run_id">): void {
@@ -294,20 +333,41 @@ export function emitClaimsForHunk(ws: Workspace, db: Sqlite.Database, input: Cla
   } else if (linkedEvents.length === 0) {
     instructedReason = "帰属イベントに会話文脈参照がない";
   } else {
-    const ev = linkedEvents[0];
-    if (ev.transcriptLine === null || !fs.existsSync(ev.sessionRef)) {
+    // REQ-831-B: 会話窓を linkedEvents[0] に固定しない。
+    // refs の順序は span 挿入順(最古のop先頭)なので、先頭が touched(位置が重なっただけ)で
+    // 真の author が後ろにいることがある。author を優先し、無ければ全イベントの窓を探索する
+    const authorRefs = new Set(
+      (input.attribution.refSupport ?? []).filter((r) => r.support === "author").map((r) => r.operation_id),
+    );
+    const ordered = [
+      ...linkedEvents.filter((e) => authorRefs.has(e.operationId)),
+      ...linkedEvents.filter((e) => !authorRefs.has(e.operationId)),
+    ];
+    const readable = ordered.filter((e) => e.transcriptLine !== null && fs.existsSync(e.sessionRef));
+    if (readable.length === 0) {
       instructedReason = "transcriptが読めない(context_status=transcript_broken)";
     } else {
       // REQ-702: 探索範囲は「編集より前の同一セッションの全user発話」。
       // 直近N件に限ると、少し前にある指示を見落として誤った断定につながる
-      const utterances = recentUserUtterances(ev.sessionRef, ev.transcriptLine, UTTERANCE_SCAN_MAX, ev.agent);
+      const utterances: UserUtterance[] = [];
+      const seen = new Set<string>();
+      for (const e of readable) {
+        for (const u of recentUserUtterances(e.sessionRef, e.transcriptLine, UTTERANCE_SCAN_MAX, e.agent)) {
+          const key = `${u.path}:${u.line}`;
+          if (seen.has(key)) continue;
+          seen.add(key);
+          utterances.push(u);
+        }
+      }
       if (utterances.length === 0) {
         instructedReason = "編集より前のuser発話が見つからない";
       } else {
         const targets = hunkTargets(input.file, input.hunk);
         let best: { u: UserUtterance; hit: string[] } | null = null;
+        let suppressedByNegation = false;
         for (const u of utterances) {
           const m = instructionMatch(u.text, targets);
+          if (m.suppressed) suppressedByNegation = true;
           if (m.matched) {
             const hit = [...m.hitSymbols, ...m.hitFiles];
             if (!best || hit.length > best.hit.length) best = { u, hit };
@@ -326,7 +386,12 @@ export function emitClaimsForHunk(ws: Workspace, db: Sqlite.Database, input: Cla
           // REQ-701: 「探して見つからなかった」を「指示されていない」と断定しない。
           // 探索範囲の完全性・言い換え・同意表現の解決を保証できないため判定不能とする。
           // ただし「探したが検出できなかった」という観測はレビュー優先度の材料として残す
-          instructedReason = `探索範囲内に明示指示を検出できず(探索: 同一セッションの編集前user発話${utterances.length}件)`;
+          // REQ-831-C: 否定で抑制した場合はそう書く。
+          // 汎用の「検出できず」のままだと、transcript に対象の話が出ているのに
+          // レビュアーには「指示なし」と見える = 新しい無音の失敗を作ってしまう
+          instructedReason = suppressedByNegation
+            ? `対象語に一致する発話はあったが否定表現を伴うため根拠に採用せず(探索: 編集前user発話${utterances.length}件)`
+            : `探索範囲内に明示指示を検出できず(探索: 同一セッションの編集前user発話${utterances.length}件)`;
           instructedObservation = "no_match_in_scope";
           instructedEvidence = utterances.slice(0, 3).map((u) => ({
             type: "transcript" as const,
