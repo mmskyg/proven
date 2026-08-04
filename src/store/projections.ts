@@ -162,10 +162,21 @@ export function applyEvent(db: Sqlite.Database, env: EventEnvelope): void {
           : db.prepare("SELECT file, status FROM edit_events WHERE operation_id=?").all(p.operation_id)
       ) as { file: string; status: string }[];
       if (rows.length === 0) {
-        db.prepare(
-          `INSERT INTO meta(key,value) VALUES('orphan_posts','1')
-           ON CONFLICT(key) DO UPDATE SET value=CAST(CAST(value AS INTEGER)+1 AS TEXT)`,
-        ).run();
+        // REQ-833: ingestは毎回 edits.jsonl を全再適用するため、ここを無条件に加算すると
+        // 孤児post 1件が実行のたびに増える(rebuild後の値と食い違う)。
+        // 孤児のoperation_idを記録し、同じものは二重に数えない
+        const seen = db
+          .prepare("SELECT 1 FROM meta WHERE key=?")
+          .get(`orphan_post:${p.operation_id}:${p.file ?? ""}`);
+        if (!seen) {
+          db.prepare("INSERT INTO meta(key,value) VALUES(?,'1')").run(
+            `orphan_post:${p.operation_id}:${p.file ?? ""}`,
+          );
+          db.prepare(
+            `INSERT INTO meta(key,value) VALUES('orphan_posts','1')
+             ON CONFLICT(key) DO UPDATE SET value=CAST(CAST(value AS INTEGER)+1 AS TEXT)`,
+          ).run();
+        }
       } else {
         const upd = db.prepare(
           `UPDATE edit_events SET result_blob_hash=?, ts_post=?, status=CASE WHEN ?='success' THEN 'completed' ELSE 'failed' END
@@ -296,15 +307,24 @@ export function applyEvent(db: Sqlite.Database, env: EventEnvelope): void {
 
 /** post無しpreのaborted/pending導出(ingest時)。transcript終了 or 24h経過→aborted */
 export function derivePendingStatuses(db: Sqlite.Database, now: Date, isSessionEnded: (sessionRef: string) => boolean): void {
-  const rows = db.prepare(`SELECT operation_id, session_ref, ts_pre FROM edit_events WHERE status='pending'`).all() as {
+  const rows = db
+    .prepare(`SELECT operation_id, file, session_ref, ts_pre FROM edit_events WHERE status='pending'`)
+    .all() as {
     operation_id: string;
+    file: string;
     session_ref: string;
     ts_pre: string;
   }[];
   for (const r of rows) {
     const age = now.getTime() - new Date(r.ts_pre).getTime();
     if (age >= ABORT_AFTER_MS || isSessionEnded(r.session_ref)) {
-      db.prepare(`UPDATE edit_events SET status='aborted' WHERE operation_id=?`).run(r.operation_id);
+      // REQ-833: 主キーは(operation_id, file)。fileとstatusで絞らないと、
+      // 1操作で複数ファイルを編集するハーネス(codexのapply_patch)で、
+      // 同じ操作の completed 行まで aborted に落ちる。
+      // ingestは completed しか読まないため、そのファイルの来歴が黙って消える
+      db.prepare(
+        `UPDATE edit_events SET status='aborted' WHERE operation_id=? AND file=? AND status='pending'`,
+      ).run(r.operation_id, r.file);
     }
   }
 }
