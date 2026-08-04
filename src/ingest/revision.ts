@@ -21,6 +21,8 @@ export interface Manifest {
 export interface Revision {
   ref: string; // commit:<oid> | worktree:<manifest_sha256>
   manifest: Manifest;
+  /** 読めなかったパス(REQ-829)。commit revision のみ設定される */
+  unreadable?: string[];
 }
 
 /** proven自身の管理ファイルか(REQ-822)。追跡対象外だが「除外した」とは数えない */
@@ -34,11 +36,37 @@ function excludedByCapture(ws: Workspace, rel: string): boolean {
   return matchAnyGlob(rel, cfg.capture.exclude);
 }
 
+/**
+ * gitのパス出力を生のUTF-8で受け取るための引数(REQ-829)。
+ *
+ * 既定(`core.quotepath=true`)では non-ASCII が octal-quote されて
+ * `"\346\227\245..."` の形で返る。これをそのままパスとして扱うと
+ * `fs.existsSync` が false になり、**日本語名のファイルが黙ってmanifestから消える**。
+ * 警告も出ないので「捕捉0件」と「変更なし」が区別できなくなる。
+ *
+ * `-z`(NUL区切り)ではなくこちらを選ぶ理由は、出力パーサ(split("\n")と
+ * ls-treeの正規表現)を書き換えずに済むため。
+ * **その代わり改行を含むファイル名は依然として扱えない。**
+ */
+const QUOTEPATH_OFF = ["-c", "core.quotepath=off"];
+
 /** worktree revision: git ls-files集合からcapture.exclude/.provenを強制除外(3.5) */
-export function buildWorktreeRevision(ws: Workspace): { rev: Revision; excludedCount: number } {
-  const out = git(ws.repoRoot, ["ls-files", "--cached", "--others", "--exclude-standard"]).toString();
+export function buildWorktreeRevision(ws: Workspace): {
+  rev: Revision;
+  excludedCount: number;
+  /** git的には存在するが読めなかったパス(REQ-829)。黙って捨てず呼び出し側で警告する */
+  unreadable: string[];
+} {
+  const out = git(ws.repoRoot, [
+    ...QUOTEPATH_OFF,
+    "ls-files",
+    "--cached",
+    "--others",
+    "--exclude-standard",
+  ]).toString();
   const all = out.split("\n").filter((l) => l.length > 0);
   const entries: ManifestEntry[] = [];
+  const unreadable: string[] = [];
   let excludedCount = 0;
   for (const rel of all.sort()) {
     if (excludedByCapture(ws, rel)) {
@@ -49,17 +77,27 @@ export function buildWorktreeRevision(ws: Workspace): { rev: Revision; excludedC
       continue;
     }
     const abs = path.join(ws.repoRoot, rel);
-    if (!fs.existsSync(abs) || !fs.statSync(abs).isFile()) continue;
-    const buf = fs.readFileSync(abs);
+    let buf: Buffer;
+    let mode: string;
+    try {
+      const st = fs.statSync(abs);
+      if (!st.isFile()) continue; // ディレクトリ・symlink等は元から対象外
+      buf = fs.readFileSync(abs);
+      mode = (st.mode & 0o111) !== 0 ? "100755" : "100644";
+    } catch {
+      // REQ-829: 以前はここで無言の continue だった。パス破損・権限・競合削除の
+      // いずれでも同じく無音になるため、必ず呼び出し側へ知らせる
+      unreadable.push(rel);
+      continue;
+    }
     const bin = isBinary(buf) || isOversize(buf);
     const { hash } = putObject(ws, buf); // storableのみ本文保存
-    const mode = (fs.statSync(abs).mode & 0o111) !== 0 ? "100755" : "100644";
     entries.push({ path: rel, mode, content_sha256: hash, size: buf.length, binary: bin });
   }
   const manifest: Manifest = { files: entries };
   const canonical = JSON.stringify(manifest);
   const { hash } = putObject(ws, Buffer.from(canonical));
-  return { rev: { ref: `worktree:${hash}`, manifest }, excludedCount };
+  return { rev: { ref: `worktree:${hash}`, manifest }, excludedCount, unreadable };
 }
 
 /** commit revision: ls-tree全blobをcontent_sha256化(objects保存)しmanifest構築 */
@@ -70,21 +108,30 @@ export function buildCommitRevision(ws: Workspace, refspec: string): Revision {
   } catch {
     throw new ProvenError("input", `不正なref: ${refspec}`);
   }
-  const out = git(ws.repoRoot, ["ls-tree", "-r", oid]).toString();
+  const out = git(ws.repoRoot, [...QUOTEPATH_OFF, "ls-tree", "-r", oid]).toString();
   const entries: ManifestEntry[] = [];
+  const unreadable: string[] = [];
   for (const line of out.split("\n")) {
     if (!line) continue;
     const m = line.match(/^(\d+) blob ([0-9a-f]+)\t(.+)$/);
     if (!m) continue;
     const [, mode, , rel] = m;
     if (excludedByCapture(ws, rel)) continue;
-    const buf = git(ws.repoRoot, ["cat-file", "blob", `${oid}:${rel}` as string]);
+    let buf: Buffer;
+    try {
+      buf = git(ws.repoRoot, ["cat-file", "blob", `${oid}:${rel}` as string]);
+    } catch {
+      // REQ-829: 1ファイルのcat-file失敗で ingest 全体を落とさない。
+      // 以前は raw な git fatal がそのまま外へ出ていた
+      unreadable.push(rel);
+      continue;
+    }
     const bin = isBinary(buf) || isOversize(buf);
     const { hash } = putObject(ws, buf);
     entries.push({ path: rel, mode, content_sha256: hash, size: buf.length, binary: bin });
   }
   entries.sort((a, b) => (a.path < b.path ? -1 : 1));
-  return { ref: `commit:${oid}`, manifest: { files: entries } };
+  return { ref: `commit:${oid}`, manifest: { files: entries }, unreadable };
 }
 
 /** refからmanifest復元。worktreeはobjects、commitは再構築 */

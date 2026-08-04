@@ -129,6 +129,37 @@ Claude Code の transcript は、**コンパクション要約**と**スラッ�
 `isMeta` が付く**ため、弾くと指示が丸ごと見えなくなる(実測: 対象セッションの
 ユーザー発話40件がすべてチャネル経由)。
 
+## REQ-829 non-ASCII ファイル名を黙って落とさない
+
+`git ls-files` / `git ls-tree` は既定(`core.quotepath=true`)で non-ASCII パスを
+octal-quote して返す。この引用符付き文字列をパスとして扱うと `fs.existsSync` が false になり、
+**日本語名のファイルが警告も無く manifest から消える**。編集してもレビュー対象に現れず、
+「捕捉0件」と「変更なし」が区別できない ＝ REQ-820 が警告した無音の失敗そのもの。
+
+- git 呼び出しに `-c core.quotepath=off` を付ける。
+  `-z` は出力パーサの書き換えが必要なため採らない。**改行入りファイル名は依然として扱えない**
+- 読めなかったパスは捨てずに集め、**ファイル名つきで警告に出す**。
+  パス破損・権限・競合削除のいずれでも無音にならないようにする
+- commit revision 側も per-file の `cat-file` 失敗で ingest 全体を落とさない
+- `commitHeadRefOrEmpty` の握りつぶしを廃止。失敗理由を持ち帰り警告に出す。
+  以前は revision 構築の実バグが「対象なし(差分がありません)」に化けていた
+
+**移行時の注意**: 修正後の初回 ingest は、これらのファイルを含まない旧 head manifest との差分になるため、
+**ファイル全体の追加 hunk として大量に出る**。回帰ではない。`input_digest` も変わるので dedupe されない。
+
+## REQ-833 pending 中断が同一操作の完了行を巻き添えにしない
+
+`derivePendingStatuses` の UPDATE が `WHERE operation_id=?` のみで、
+主キー `(operation_id, file)` のうち file を絞っていなかった。
+1操作で複数ファイルを編集するハーネス(codex の `apply_patch`)では、
+**1ファイルが pending のまま24h経過すると同じ操作の completed 行まで aborted になる**。
+ingest は completed しか読まないため、そのファイルの来歴が黙って消える。
+
+`WHERE operation_id=? AND file=? AND status='pending'` にする。
+
+あわせて孤児 post の二重計上を修正する。ingest は毎回 edits.jsonl を全再適用するため、
+pre の無い post 1件が実行のたびに加算され、`rebuild` 後の値と食い違っていた。
+
 ### 「使わないと決めた」を表明できるようにする
 
 `spec_sources: []` を「仕様書を使わないと決めた」表明として扱い、未決から外す。

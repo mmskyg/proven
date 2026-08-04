@@ -93,7 +93,21 @@ export function runIngest(ws: Workspace, opts: { range?: string } = {}): IngestS
       const wt = buildWorktreeRevision(ws);
       excludedCount = wt.excludedCount;
       headRef = wt.rev.ref;
-      baseRef = last ? last.head_revision_ref : commitHeadRefOrEmpty(ws) ?? headRef;
+      if (wt.unreadable.length > 0) {
+        warnings.push(`読めなかったため対象外にしたファイル: ${wt.unreadable.join(", ")}`);
+      }
+      if (last) {
+        baseRef = last.head_revision_ref;
+      } else {
+        // REQ-829: 以前は失敗を握りつぶして baseRef=headRef にしていたため、
+        // revision構築のエラーが「対象なし(差分がありません)」という誤ったメッセージに化けていた
+        const head = commitHeadRef(ws);
+        if (head.ref) baseRef = head.ref;
+        else {
+          baseRef = headRef;
+          warnings.push(`HEADのcommit revision構築に失敗したため基準を現在のworktreeにしました: ${head.error}`);
+        }
+      }
     }
     if (excludedCount > 0) warnings.push(`exclude対象${excludedCount}件は追跡外です`);
 
@@ -316,11 +330,16 @@ export function runIngest(ws: Workspace, opts: { range?: string } = {}): IngestS
   }
 }
 
-function commitHeadRefOrEmpty(ws: Workspace): string | null {
+/**
+ * HEADのcommit revisionを構築する(REQ-829)。
+ * 失敗を握りつぶさず理由を返す。初回ingestで HEAD が無いのは正常だが、
+ * revision構築の実バグも同じ経路を通るため、区別できるよう理由を持ち帰る。
+ */
+function commitHeadRef(ws: Workspace): { ref: string | null; error: string } {
   try {
-    return buildCommitRevision(ws, "HEAD").ref;
-  } catch {
-    return null;
+    return { ref: buildCommitRevision(ws, "HEAD").ref, error: "" };
+  } catch (e) {
+    return { ref: null, error: e instanceof Error ? e.message : String(e) };
   }
 }
 
