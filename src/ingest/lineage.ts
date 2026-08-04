@@ -227,12 +227,67 @@ export function refSupportOf(contents: EventContent[], refs: string[], hunk: Raw
   return refs.map((id) => {
     const c = contents.find((x) => x.operationId === id);
     if (!c) return { operation_id: id, support: "unknown" as RefSupport };
-    const matched = [
-      ...multisetIntersect(hunk.addedLines, c.addedLines),
-      ...multisetIntersect(hunk.removedLines, c.removedLines),
-    ].filter(isInformativeLine);
-    return { operation_id: id, support: (matched.length > 0 ? "author" : "touched") as RefSupport };
+    return { operation_id: id, support: authorSupport(hunk, c) ? "author" : "touched" };
   });
+}
+
+/**
+ * この編集がこのhunkを作ったと言えるか(REQ-501/502 + REQ-835)。
+ *
+ * 旧規則は「一致した行のうち1本でも isInformativeLine を満たすこと」だけだった。
+ * これは1行単位では正しい(定型行1本の一致は偶然でありうる)が、**連言を見ていない**。
+ * 偶然の一致は孤立して起きるもので、連続した並びや全行被覆の形にはならない。
+ *
+ * 実測(このリポジトリ294 hunk)で author 被覆は 53.7%。落ちているのは
+ * 「変更行がどれも単独では弱い」小さな修正——最も多い編集形——だった。
+ *
+ * そこで次のいずれかを満たせば author とする:
+ *  (a) 一致行に informative なものが1本でもある(従来規則。定型行の門はそのまま)
+ *  (b) 一致行が hunk 側・イベント側の**双方で連続2行以上**をなす(並び自体が情報)
+ *  (c) イベントの差分が hunk の変更行を**全て**含み、hunk が2行以上(全被覆は偶然の形ではない)
+ *
+ * `const x = 500;` 単独は (a)(b)(c) いずれも満たさず touched のまま。
+ */
+function authorSupport(hunk: RawHunk, c: EventContent): boolean {
+  const matched = [
+    ...multisetIntersect(hunk.addedLines, c.addedLines),
+    ...multisetIntersect(hunk.removedLines, c.removedLines),
+  ];
+  // (a) 従来規則
+  if (matched.some(isInformativeLine)) return true;
+  if (matched.length === 0) return false;
+  // (b) 連続した並び(informativeness は問わない。並んでいること自体が根拠)
+  if (contiguousRun(hunk.addedLines, c.addedLines) >= 2) return true;
+  if (contiguousRun(hunk.removedLines, c.removedLines) >= 2) return true;
+  // (c) hunkの変更行をイベントが全て含む。
+  // 「2行以上」は added / removed の**片側で**数える。両者の合計にすると
+  // 1行置換(added 1 + removed 1)が該当してしまい、(a)で弾いたはずの
+  // 「弱い行1本」が裏口から author になる
+  const added = hunk.addedLines.filter((l) => l.trim() !== "");
+  const removed = hunk.removedLines.filter((l) => l.trim() !== "");
+  const multiLine = added.length >= 2 || removed.length >= 2;
+  if (multiLine && matched.length >= added.length + removed.length) return true;
+  return false;
+}
+
+/** target の並びが source にそのまま現れる最長の長さ(informativeness は問わない) */
+function contiguousRun(target: string[], source: string[]): number {
+  let best = 0;
+  for (let i = 0; i < target.length; i++) {
+    if (target[i].trim() === "") continue;
+    const start = source.indexOf(target[i]);
+    if (start < 0) continue;
+    let run = 0;
+    let s = start;
+    let t = i;
+    while (t < target.length && s < source.length && target[t] === source[s] && target[t].trim() !== "") {
+      run++;
+      t++;
+      s++;
+    }
+    best = Math.max(best, run);
+  }
+  return best;
 }
 
 const CANDIDATE_CONF_MAX = 0.4;

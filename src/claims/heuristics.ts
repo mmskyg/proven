@@ -367,7 +367,16 @@ export function emitClaimsForHunk(ws: Workspace, db: Sqlite.Database, input: Cla
     const isReadable = (e: { transcriptLine: number | null; sessionRef: string }): boolean =>
       e.transcriptLine !== null && fs.existsSync(e.sessionRef);
     const authorReadable = linkedEvents.filter((e) => authorRefs.has(e.operationId) && isReadable(e));
-    const readable = authorReadable.length > 0 ? authorReadable : linkedEvents.filter(isReadable);
+    // author が分からないときは **最古のref の窓だけ** を見る。
+    // 最古refより前の発話は、誰がauthorであっても必ずその編集より前にあるので
+    // 時間的に許容できる。後ろの窓の発話が許容できるのは「authorはもっと後だった」
+    // という検証不能な仮定を置いたときだけ。
+    //
+    // ここは「最古の**読める**ref」にしてはいけない。最古が読めないからと次へ滑ると、
+    // まさにその無効なケース(真のauthorの編集より後の発話)を通してしまう。
+    // 読めなければ判定不能に落とす(旧 linkedEvents[0] は偶然これを守っていた)
+    const readable =
+      authorReadable.length > 0 ? authorReadable : linkedEvents.slice(0, 1).filter(isReadable);
     if (readable.length === 0) {
       instructedReason = "transcriptが読めない(context_status=transcript_broken)";
     } else {
